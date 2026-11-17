@@ -14,15 +14,15 @@
     "not_found_handling": "404-page"
   },
   "d1_databases": [
-    { "binding": "DB", "database_name": "aveela", "database_id": "448e1402-5406-44cb-b839-f71c3bdcff83", "migrations_dir": "migrations" }
+    { "binding": "DB", "database_name": "aveela", "database_id": "REPLACE_ME", "migrations_dir": "migrations" }
   ],
   "kv_namespaces": [
-    { "binding": "SLIPS", "id": "a7990b25e7e14836952d5c1152135cdb" }
+    { "binding": "SLIPS", "id": "REPLACE_ME" }
   ],
   "triggers": { "crons": ["17 * * * *"] },
   "vars": {
-    "APP_URL": "https://aveela.pages.dev",
-    "MAIL_FROM": "Aveela Event Space <bookings@aveela.com>",
+    "APP_URL": "https://aveela.YOUR-SUBDOMAIN.workers.dev",
+    "MAIL_FROM": "Aveela Event Space <bookings@your-domain.com>",
     "VENUE_TZ": "Indian/Maldives",
     "SERVER_HASH_ITERATIONS": "20000"
   },

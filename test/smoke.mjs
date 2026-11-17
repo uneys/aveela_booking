@@ -292,4 +292,15 @@ ok(valid && JSON.parse(Buffer.from(pl, 'base64url')).sub === 'com.aveela.web', '
 r = await ap('GET', '/api/me');
 ok(r.data.user.name === 'Dana Ali' && r.data.user.verified && r.data.user.apple, 'new Apple account created with name, verified');
 
+origLog('Cloudflare Pages entry points');
+const pagesApi = (await import('../functions/api/[[path]].js')).onRequest;
+const pagesAuth = (await import('../functions/auth/[[path]].js')).onRequest;
+const pctx = (path) => ({ request: new Request('https://aveela.test' + path, { redirect: 'manual' }), env, waitUntil: () => {} });
+r = await pagesApi(pctx('/api/config'));
+ok(r.status === 200 && (await r.json()).openHour === 8, 'Pages function serves /api/*');
+r = await pagesApi(pctx('/api/health'));
+ok((await r.json()).checks.tables === true, 'Pages health check reports tables present');
+r = await pagesAuth(pctx('/auth/verify?token=nope'));
+ok(r.status === 302 && r.headers.get('location') === '/account?verify=expired', 'Pages function serves /auth/*');
+
 origLog(`\nAll ${passed} checks passed.`);

@@ -7,12 +7,13 @@ import { handleBookings } from './routes/bookings.js';
 import { handleAdmin } from './routes/admin.js';
 
 const DASH = 'Cloudflare dashboard → Workers & Pages → aveela → Settings';
+const BIND = 'Cloudflare dashboard → Workers & Pages → aveela → Settings → Bindings';
 
 // Configuration problems that stop the API from working, in plain words.
 function setupProblem(env) {
-  if (!env.DB) return `Server setup is incomplete: the D1 database is not connected. Check database_id in wrangler.jsonc.`;
-  if (!env.SLIPS) return `Server setup is incomplete: the KV namespace is not connected. Check the kv_namespaces id in wrangler.jsonc.`;
-  if (!env.APP_URL) return `Server setup is incomplete: APP_URL is missing from wrangler.jsonc.`;
+  if (!env.DB) return `Server setup is incomplete: the D1 database is not connected. On Pages: add a D1 binding named DB in ${BIND}, then redeploy. On Workers: check database_id in wrangler.jsonc.`;
+  if (!env.SLIPS) return `Server setup is incomplete: the KV namespace is not connected. On Pages: add a KV binding named SLIPS in ${BIND}, then redeploy. On Workers: check the kv_namespaces id in wrangler.jsonc.`;
+  if (!env.APP_URL) return `Server setup is incomplete: add the variable APP_URL (your site address, e.g. https://aveela.pages.dev) in ${DASH} → Variables and Secrets, then redeploy.`;
   if (!env.PEPPER || env.PEPPER.length < 32) return `Server setup is incomplete: add the PEPPER secret (at least 32 characters) in ${DASH} → Variables and Secrets, with type "Secret".`;
   return '';
 }
@@ -28,7 +29,7 @@ async function health(env, url) {
   const problems = [];
   if (env.DB) {
     try { await env.DB.prepare('SELECT COUNT(*) AS n FROM settings').first(); checks.tables = true; }
-    catch { problems.push('Database tables are missing. The "Apply database migrations" step has not run on this database.'); }
+    catch { problems.push('Database tables are missing. Paste migrations/0001_initial.sql into the D1 console (Storage & databases → D1 → aveela → Console) and run it.'); }
   }
   const p = setupProblem(env); if (p) problems.unshift(p);
   if (env.APP_URL && !checks.appUrlMatches) problems.push(`APP_URL in wrangler.jsonc is ${env.APP_URL} but this site is ${url.origin}. Links in emails and Google/Apple sign-in need them to match.`);
@@ -64,8 +65,19 @@ async function route(request, env, ctx) {
   return withSecurityHeaders(res, { page: type.includes('text/html'), noindex: isAdminPage || path === '/account' });
 }
 
+async function housekeeping(env) {
+  const t = now();
+  await expireUnpaid(env);
+  await env.DB.prepare('DELETE FROM sessions WHERE expires_at < ?').bind(t).run();
+  await env.DB.prepare('DELETE FROM tokens WHERE expires_at < ?').bind(t).run();
+  await env.DB.prepare('DELETE FROM rate_limits WHERE window_start < ?').bind(t - 24 * 3600 * 1000).run();
+  await env.DB.prepare('DELETE FROM audit_log WHERE at < ?').bind(t - 365 * 24 * 3600 * 1000).run();
+}
+
 export default {
   async fetch(request, env, ctx) {
+    // Cloudflare Pages has no scheduled jobs, so roughly 1 request in 200 also does the cleanup.
+    if (env.DB && Math.random() < 0.005) ctx.waitUntil(housekeeping(env).catch(() => {}));
     try {
       return await route(request, env, ctx);
     } catch (e) {
@@ -75,7 +87,7 @@ export default {
       console.log('Unhandled error', e && e.stack);
       const msg = String((e && e.message) || '');
       if (/no such table/i.test(msg)) {
-        return withSecurityHeaders(json({ error: 'Database tables are missing. Run the "Apply database migrations" step (re-run the GitHub workflow).', code: 'setup' }, 500), { noindex: true });
+        return withSecurityHeaders(json({ error: 'Database tables are missing. Paste migrations/0001_initial.sql into the D1 console (Storage & databases → D1 → aveela → Console) and run it.', code: 'setup' }, 500), { noindex: true });
       }
       return withSecurityHeaders(json({ error: 'Something went wrong on our side. Try again in a moment.' }, 500), { noindex: true });
     }
@@ -83,13 +95,6 @@ export default {
 
   // Hourly housekeeping (cron in wrangler.jsonc): expire unpaid approvals, clear old sessions/tokens/limits.
   async scheduled(event, env, ctx) {
-    const t = now();
-    ctx.waitUntil((async () => {
-      await expireUnpaid(env);
-      await env.DB.prepare('DELETE FROM sessions WHERE expires_at < ?').bind(t).run();
-      await env.DB.prepare('DELETE FROM tokens WHERE expires_at < ?').bind(t).run();
-      await env.DB.prepare('DELETE FROM rate_limits WHERE window_start < ?').bind(t - 24 * 3600 * 1000).run();
-      await env.DB.prepare('DELETE FROM audit_log WHERE at < ?').bind(t - 365 * 24 * 3600 * 1000).run();
-    })());
+    ctx.waitUntil(housekeeping(env));
   },
 };

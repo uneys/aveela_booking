@@ -124,6 +124,29 @@ npm run deploy                                # applies migrations, then deploys
 
 ---
 
+## Hosting on Cloudflare Pages instead
+
+If you connected the repository under **Workers & Pages → Pages → Connect to Git** (your address ends in `.pages.dev`), it works too. The `functions/` folder runs the booking code on Pages. Pages deploys every push by itself, and the GitHub workflow then only runs the tests.
+
+1. **Build settings** (Pages project → Settings → Build): Framework preset *None*, Build command *empty*, Build output directory `public`. Root directory: empty if `functions/` is at the top of your repository, otherwise the folder that contains it.
+2. **Create storage** if you haven't: Storage & databases → D1 → create `aveela`; Workers KV → create `aveela-slips`.
+3. **Bindings** (Pages project → Settings → Bindings → Add):
+   - *D1 database*: variable name `DB` → `aveela`
+   - *KV namespace*: variable name `SLIPS` → `aveela-slips`
+4. **Variables and Secrets** (Pages project → Settings → Variables and Secrets → Add), for *Production*:
+   - `APP_URL` (Text): `https://aveela.pages.dev`, your exact address with no trailing slash
+   - `MAIL_FROM` (Text): e.g. `Aveela Event Space <bookings@your-domain.com>`
+   - `PEPPER` (**Secret**): at least 32 random characters. Never change or lose it
+   - `SETUP_TOKEN` (**Secret**): a long random string
+   - Later, as needed: `RESEND_API_KEY`, `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET` and the `APPLE_…` secrets (all **Secret**)
+5. **Create the tables**: Storage & databases → D1 → `aveela` → **Console**. Paste the whole of `migrations/0001_initial.sql` and run it. For future migrations, paste each new file the same way.
+6. **Redeploy**: bindings and variables only apply to new deployments. Go to Deployments → the latest one → ⋯ → **Retry deployment**.
+7. Open `https://aveela.pages.dev/api/health`. When it shows `"ok":true`, go to `/admin` to create the master admin, then delete `SETUP_TOKEN`.
+
+On Pages there are no scheduled jobs. Unpaid approvals still expire on time, because that's checked whenever bookings are read, and old sessions are tidied up during normal traffic.
+
+---
+
 ## If something isn't working
 
 **First, open `https://YOUR-ADDRESS/api/health`.** It lists anything that's not set up, in plain words (it never shows secret values). The GitHub workflow also prints these as warnings at the end of each deploy.
@@ -275,6 +298,7 @@ src/routes/bookings.js  Availability, requests, slip upload
 src/routes/admin.js     Admin panel API, admins, settings, audit log
 src/lib/                Hashing, sessions, rate limits, email
 public/                 Website, account page (/account), admin panel (/admin)
+functions/              Runs the same API on Cloudflare Pages
 migrations/              Database tables and default settings (D1 migrations)
 .github/workflows/      Test and deploy on every push to main
 wrangler.jsonc          Cloudflare configuration
