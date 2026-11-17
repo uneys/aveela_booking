@@ -6,6 +6,36 @@ import { handleAuth } from './routes/auth.js';
 import { handleBookings } from './routes/bookings.js';
 import { handleAdmin } from './routes/admin.js';
 
+const DASH = 'Cloudflare dashboard → Workers & Pages → aveela → Settings';
+
+// Configuration problems that stop the API from working, in plain words.
+function setupProblem(env) {
+  if (!env.DB) return `Server setup is incomplete: the D1 database is not connected. Check database_id in wrangler.jsonc.`;
+  if (!env.SLIPS) return `Server setup is incomplete: the KV namespace is not connected. Check the kv_namespaces id in wrangler.jsonc.`;
+  if (!env.APP_URL) return `Server setup is incomplete: APP_URL is missing from wrangler.jsonc.`;
+  if (!env.PEPPER || env.PEPPER.length < 32) return `Server setup is incomplete: add the PEPPER secret (at least 32 characters) in ${DASH} → Variables and Secrets, with type "Secret".`;
+  return '';
+}
+
+// GET /api/health: which parts are set up. Shows only yes/no, never secret values.
+async function health(env, url) {
+  const checks = {
+    database: !!env.DB, slipStorage: !!env.SLIPS, pepper: !!(env.PEPPER && env.PEPPER.length >= 32),
+    appUrl: env.APP_URL || null, appUrlMatches: !!env.APP_URL && env.APP_URL.replace(/\/+$/, '') === url.origin,
+    tables: false, email: !!env.RESEND_API_KEY, google: !!(env.GOOGLE_CLIENT_ID && env.GOOGLE_CLIENT_SECRET),
+    apple: !!(env.APPLE_CLIENT_ID && env.APPLE_TEAM_ID && env.APPLE_KEY_ID && env.APPLE_PRIVATE_KEY),
+  };
+  const problems = [];
+  if (env.DB) {
+    try { await env.DB.prepare('SELECT COUNT(*) AS n FROM settings').first(); checks.tables = true; }
+    catch { problems.push('Database tables are missing. The "Apply database migrations" step has not run on this database.'); }
+  }
+  const p = setupProblem(env); if (p) problems.unshift(p);
+  if (env.APP_URL && !checks.appUrlMatches) problems.push(`APP_URL in wrangler.jsonc is ${env.APP_URL} but this site is ${url.origin}. Links in emails and Google/Apple sign-in need them to match.`);
+  if (!checks.email) problems.push('Emails are not being sent: add the RESEND_API_KEY secret (optional, see README section 2).');
+  return json({ ok: problems.filter((x) => !x.startsWith('Emails')).length === 0, checks, problems });
+}
+
 async function route(request, env, ctx) {
   const url = new URL(request.url);
   const path = url.pathname.replace(/\/+$/, '') || '/';
@@ -13,7 +43,9 @@ async function route(request, env, ctx) {
   const isAuth = path.startsWith('/auth/') || path === '/auth';
 
   if (isApi || isAuth) {
-    if (!env.APP_URL) return json({ error: 'APP_URL is not configured.' }, 500);
+    if (path === '/api/health') return withSecurityHeaders(await health(env, url), { noindex: true });
+    const missing = setupProblem(env);
+    if (missing) return withSecurityHeaders(json({ error: missing, code: 'setup' }, 500), { noindex: true });
     // JSON API mutations must come from our own pages. /auth/* are browser redirects (and Apple's
     // cross-site form POST), protected by their state cookies instead.
     if (isApi && request.method !== 'GET' && request.method !== 'HEAD') assertSameOrigin(request, url);
@@ -41,6 +73,10 @@ export default {
         return withSecurityHeaders(json({ error: e.message, code: e.code }, e.status), { noindex: true });
       }
       console.log('Unhandled error', e && e.stack);
+      const msg = String((e && e.message) || '');
+      if (/no such table/i.test(msg)) {
+        return withSecurityHeaders(json({ error: 'Database tables are missing. Run the "Apply database migrations" step (re-run the GitHub workflow).', code: 'setup' }, 500), { noindex: true });
+      }
       return withSecurityHeaders(json({ error: 'Something went wrong on our side. Try again in a moment.' }, 500), { noindex: true });
     }
   },

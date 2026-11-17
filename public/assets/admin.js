@@ -435,7 +435,12 @@
   async function start() {
     if (!me) {
       const st = await A.api('GET', '/api/admin/state').catch(() => null);
-      if (!st) { gate('<h1>Can’t reach the server</h1><p class="sub">Check your connection and reload.</p>'); return; }
+      if (!st) {
+        const h = await A.api('GET', '/api/health').catch(() => null);
+        const list = h && h.problems.length ? `<ul style="padding-left:18px;line-height:1.5">${h.problems.map((p) => `<li>${esc(p)}</li>`).join('')}</ul>` : '<p class="sub">Check your connection and reload.</p>';
+        gate(`<h1>Setup isn't finished</h1>${list}<p class="sub">Fix these, then reload this page.</p>`);
+        return;
+      }
       if (st.needsSetup) return setupScreen(st.setupEnabled);
       if (!st.admin) return loginScreen();
       me = st.admin;

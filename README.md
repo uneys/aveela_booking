@@ -124,6 +124,39 @@ npm run deploy                                # applies migrations, then deploys
 
 ---
 
+## If something isn't working
+
+**First, open `https://YOUR-ADDRESS/api/health`.** It lists anything that's not set up, in plain words (it never shows secret values). The GitHub workflow also prints these as warnings at the end of each deploy.
+
+**GitHub Actions run is red:** open the **Actions** tab → the failed run → the red step, and match the error:
+
+| Step / error | Fix |
+|---|---|
+| **Check setup** fails | It lists what's missing: the two GitHub secrets, the `REPLACE_ME` ids or `APP_URL` in `wrangler.jsonc`. |
+| **Run tests** fails | A code change broke something. The log names the failing check. Nothing was deployed. |
+| `Authentication error [code: 10000]` | The API token lacks a permission. Edit it and make sure it has **Workers Scripts: Edit** *and* **D1: Edit**, for the right account. Update the `CLOUDFLARE_API_TOKEN` secret if you made a new token. |
+| `Couldn't find a D1 DB with the name or binding 'aveela'` | The database must be named exactly `aveela`, and its id must be in `wrangler.jsonc`. |
+| `KV namespace ... is not valid` / `not found` | The KV id in `wrangler.jsonc` is wrong. Copy it again from Storage & databases → Workers KV. |
+| `You need to register a workers.dev subdomain` | Open **Workers & Pages** in the Cloudflare dashboard once and pick a subdomain, then re-run the workflow. |
+| `account ID ... does not match` / `could not route to /accounts/...` | `CLOUDFLARE_ACCOUNT_ID` is wrong. Copy it again from Workers & Pages → Overview. |
+
+To re-run after fixing: **Actions → Test and deploy → Run workflow**.
+
+**The site loads but booking or the admin panel shows an error:**
+
+| Message | Fix |
+|---|---|
+| *Server setup is incomplete: add the PEPPER secret* | Add `PEPPER` (at least 32 characters) in Cloudflare → aveela → Settings → Variables and Secrets. Choose type **Secret**, not Text. |
+| *Database tables are missing* | The migrations step didn't run on this database. Re-run the workflow. |
+| *Setup is turned off. Set the SETUP_TOKEN secret first* | Add the `SETUP_TOKEN` secret (step 5), then reload /admin. |
+| *Online booking isn't available right now* on the home page | Open `/api/health` to see which setting is missing. |
+| Google/Apple sign-in fails, or email links point to the wrong site | `APP_URL` must exactly match your site address, and the redirect URL in Google/Apple must use the same address. |
+| No emails arrive | Add `RESEND_API_KEY` and set `MAIL_FROM` to an address on the domain you verified in Resend. Check Resend's dashboard → Logs. |
+
+Live error logs: Cloudflare → Workers & Pages → aveela → **Logs**.
+
+---
+
 ## 2. Email (Resend)
 
 Without this the site still works, but no emails go out (they are written to the Worker logs instead).
