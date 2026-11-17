@@ -22,7 +22,7 @@
   "triggers": { "crons": ["17 * * * *"] },
   "vars": {
     "APP_URL": "https://aveela.pages.dev",
-    "MAIL_FROM": "Aveela Event Space <bookings@your-domain.com>",
+    "MAIL_FROM": "Aveela Event Space <bookings@aveela.com>",
     "VENUE_TZ": "Indian/Maldives",
     "SERVER_HASH_ITERATIONS": "20000"
   },
