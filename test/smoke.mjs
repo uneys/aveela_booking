@@ -292,6 +292,81 @@ ok(valid && JSON.parse(Buffer.from(pl, 'base64url')).sub === 'com.aveela.web', '
 r = await ap('GET', '/api/me');
 ok(r.data.user.name === 'Dana Ali' && r.data.user.verified && r.data.user.apple, 'new Apple account created with name, verified');
 
+origLog('Gmail sending and resend buttons (fake Gmail server)');
+const smtpLog = [];
+let smtpPassOk = 'abcdefghijklmnop';
+globalThis.__aveelaSmtpConnect = ({ hostname, port }, opts) => {
+  const te = new TextEncoder(), td = new TextDecoder();
+  let push, inData = false, data = '', line = '';
+  const session = { host: hostname, port, tls: opts.secureTransport, cmds: [], message: '' };
+  smtpLog.push(session);
+  const readable = new ReadableStream({ start(c) { push = (t) => c.enqueue(te.encode(t)); push('220 smtp.gmail.com ESMTP ready\r\n'); } });
+  const onLine = (l) => {
+    session.cmds.push(l.split(' ')[0]);
+    if (l.startsWith('EHLO')) push('250-smtp.gmail.com at your service\r\n250-AUTH LOGIN PLAIN\r\n250 SMTPUTF8\r\n');
+    else if (l.startsWith('AUTH PLAIN ')) {
+      const [, u, pw] = Buffer.from(l.slice(11), 'base64').toString().split('\0');
+      session.user = u;
+      push(pw === smtpPassOk ? '235 2.7.0 Accepted\r\n' : '535-5.7.8 Username and Password not accepted.\r\n535 5.7.8 Learn more\r\n');
+    } else if (l.startsWith('MAIL FROM') || l.startsWith('RCPT TO')) { if (l.startsWith('RCPT')) session.rcpt = l; push('250 2.1.0 OK\r\n'); }
+    else if (l === 'DATA') { inData = true; push('354 Go ahead\r\n'); }
+    else if (l === 'QUIT') push('221 2.0.0 closing\r\n');
+  };
+  const writable = new WritableStream({ write(chunk) {
+    const t = td.decode(chunk);
+    if (inData) { data += t; if (data.endsWith('\r\n.\r\n')) { inData = false; session.message = data; push('250 2.0.0 OK queued\r\n'); } return; }
+    line += t; let i;
+    while ((i = line.indexOf('\r\n')) >= 0) { const l = line.slice(0, i); line = line.slice(i + 2); onLine(l); }
+  } });
+  return { readable, writable, close() {} };
+};
+Object.assign(env, { GMAIL_USER: 'aveela.venue@gmail.com', GMAIL_APP_PASSWORD: 'abcd efgh ijkl mnop', MAIL_FROM: 'Aveela Event Space <bookings@aveela.mv>' });
+r = await adm('GET', '/api/admin/settings');
+ok(r.data.email.provider === 'gmail' && r.data.email.from === 'aveela.venue@gmail.com', 'admin settings show Gmail as the sender');
+r = await adm('POST', `/api/admin/bookings/${bid}/resend-email`, {});
+ok(r.status === 200 && r.data.sent === 'booking confirmation' && r.data.provider === 'gmail', 'admin resends the confirmation through Gmail');
+const sess = smtpLog[smtpLog.length - 1];
+ok(sess.host === 'smtp.gmail.com' && sess.port === 465 && sess.tls === 'on', 'connects to smtp.gmail.com:465 with TLS');
+ok(sess.user === 'aveela.venue@gmail.com' && sess.cmds.join(',') === 'EHLO,AUTH,MAIL,RCPT,DATA,QUIT', 'SMTP conversation in the right order, app password spaces removed');
+ok(sess.rcpt === 'RCPT TO:<aisha@example.com>' && /^From: Aveela Event Space <aveela\.venue@gmail\.com>/m.test(sess.message), 'sent to the customer, from the Gmail account with the venue name');
+const subj = /^Subject: (.*)$/m.exec(sess.message)[1];
+ok(subj.startsWith('Confirmed:'), 'subject line correct');
+const htmlPart = sess.message.split('Content-Type: text/html; charset=UTF-8\r\nContent-Transfer-Encoding: base64\r\n\r\n')[1].split('\r\n--')[0];
+ok(Buffer.from(htmlPart.replace(/\r\n/g, ''), 'base64').toString().includes('Your booking is confirmed'), 'HTML body decodes correctly');
+r = await cust('POST', `/api/bookings/${bid}/resend-email`, {});
+ok(r.status === 200 && r.data.to === 'aisha@example.com', 'customer can resend their own confirmation');
+await cust('POST', `/api/bookings/${bid}/resend-email`, {});
+await cust('POST', `/api/bookings/${bid}/resend-email`, {});
+r = await cust('POST', `/api/bookings/${bid}/resend-email`, {});
+ok(r.status === 429, 'customer resends are rate limited');
+r = await adm('POST', '/api/admin/test-email', { to: 'owner@aveela.test' });
+ok(r.status === 200, 'test email sends');
+smtpPassOk = 'something-else';
+r = await adm('POST', '/api/admin/test-email', { to: 'owner@aveela.test' });
+ok(r.status === 502 && /App Password/.test(r.data.error), 'wrong Gmail app password gives a clear error');
+smtpPassOk = 'abcdefghijklmnop';
+const newbie = client('11.0.0.1');
+await newbie('POST', '/api/auth/signup', { name: 'Dina', email: 'dina@example.com', pw: await prehash('user', 'dina@example.com', 'dina-password-1') });
+let vs = smtpLog[smtpLog.length - 1];
+ok(vs.rcpt === 'RCPT TO:<dina@example.com>' && /^Subject: Confirm your email/m.test(vs.message), 'sign-up confirmation email goes through Gmail');
+const vbody = Buffer.from(vs.message.split('Content-Type: text/plain; charset=UTF-8\r\nContent-Transfer-Encoding: base64\r\n\r\n')[1].split('\r\n--')[0].replace(/\r\n/g, ''), 'base64').toString();
+const vlink = /https:\/\/aveela\.test\/auth\/verify\?token=([\w-]+)/.exec(vbody);
+ok(!!vlink, 'confirmation email contains the verify link');
+r = await newbie('POST', '/api/auth/resend-verification', {});
+ok(r.status === 200 && smtpLog[smtpLog.length - 1].rcpt === 'RCPT TO:<dina@example.com>', '"Send the link again" sends through Gmail');
+r = await newbie('GET', `/auth/verify?token=${/token=([\w-]+)/.exec(Buffer.from(smtpLog[smtpLog.length - 1].message.split('Content-Type: text/plain; charset=UTF-8\r\nContent-Transfer-Encoding: base64\r\n\r\n')[1].split('\r\n--')[0].replace(/\r\n/g, ''), 'base64').toString())[1]}`);
+ok(r.res.headers.get('location') === '/account?verified=1', 'the link from the resent email confirms the account');
+smtpPassOk = 'broken';
+const newbie2 = client('11.0.0.2');
+await newbie2('POST', '/api/auth/signup', { name: 'Eli', email: 'eli@example.com', pw: await prehash('user', 'eli@example.com', 'eli-password-11') });
+r = await newbie2('POST', '/api/auth/resend-verification', {});
+ok(r.status === 502 && /couldn't send/.test(r.data.error), 'if Gmail fails, "Send the link again" says so');
+await newbie('POST', '/api/auth/forgot', { email: 'dina@example.com' });
+ok(true, 'password reset uses the same sender');
+r = await anon('GET', '/api/health');
+ok(r.data.checks.email === 'gmail', 'health check reports Gmail');
+delete env.GMAIL_USER; delete env.GMAIL_APP_PASSWORD;
+
 origLog('Cloudflare Pages entry points');
 const pagesApi = (await import('../functions/api/[[path]].js')).onRequest;
 const pagesAuth = (await import('../functions/auth/[[path]].js')).onRequest;

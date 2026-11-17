@@ -1,5 +1,5 @@
 // Customer accounts: email + password, Google, Apple, verification, password reset.
-import { json, redirect, readJson, bad, unauthorized, conflict, clientIp, parseCookies, cookie, clearCookie } from '../lib/http.js';
+import { json, redirect, readJson, bad, unauthorized, conflict, clientIp, parseCookies, cookie, clearCookie, HttpError } from '../lib/http.js';
 import { hashPassword, verifyPassword, dummyVerify, validPrehash, randomToken, sha256, decodeJwtPayload, appleClientSecret } from '../lib/crypto.js';
 import { now, createSession, readSession, destroySession, destroyAllSessions, hit, peek, clearHits } from '../lib/core.js';
 import { mail } from '../lib/email.js';
@@ -48,9 +48,12 @@ async function useToken(env, purpose, token, consume = true) {
   return row.user_id;
 }
 
-async function sendVerification(env, ctx, user) {
+// At sign-up the email goes out in the background; the "send again" button waits and reports problems.
+async function sendVerification(env, ctx, user, { wait = false } = {}) {
   const token = await issueToken(env, 'verify', user.id, 24 * 3600 * 1000);
-  ctx.waitUntil(mail.verify(env, user.email, user.name, `${env.APP_URL}/auth/verify?token=${token}`));
+  const sending = mail.verify(env, user.email, user.name, `${env.APP_URL}/auth/verify?token=${token}`);
+  if (!wait) { ctx.waitUntil(sending); return { ok: true }; }
+  return sending;
 }
 
 function safeNext(next) {
@@ -125,8 +128,9 @@ export async function handleAuth(request, env, ctx, url, path) {
     const u = await requireUser(env, request);
     if (u.email_verified) return json({ ok: true, already: true });
     await hit(env, `verify:${u.id}`, 4);
-    await sendVerification(env, ctx, u);
-    return json({ ok: true });
+    const r = await sendVerification(env, ctx, u, { wait: true });
+    if (!r.ok) throw new HttpError(502, "We couldn't send the confirmation email right now. Try again in a few minutes, or contact us.", 'email_failed');
+    return json({ ok: true, to: u.email });
   }
 
   if (path === '/auth/verify' && method === 'GET') {

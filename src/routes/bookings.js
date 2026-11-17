@@ -1,8 +1,8 @@
 // Public availability, customer booking requests, bank slip upload.
-import { json, readJson, bad, forbidden, notFound, conflict, clientIp } from '../lib/http.js';
+import { json, readJson, bad, forbidden, notFound, conflict, clientIp, HttpError } from '../lib/http.js';
 import { now, getSettings, venueToday, venueHourNow, isDate, HOLDING, expireUnpaid, findClashes, newRef, hit } from '../lib/core.js';
 import { requireUser, googleEnabled, appleEnabled } from './auth.js';
-import { mail } from '../lib/email.js';
+import { mail, statusEmail } from '../lib/email.js';
 
 export const EVENT_TYPES = ['Wedding', 'Engagement', 'Birthday', 'Baby shower', 'Party', 'Corporate', 'Workshop', 'Other'];
 const MAX_SLIP = 5 * 1024 * 1024;
@@ -121,7 +121,7 @@ export async function handleBookings(request, env, ctx, url, path) {
     return json({ booking: publicBooking(b) }, 201);
   }
 
-  const m = path.match(/^\/api\/bookings\/(\d+)\/(cancel|slip)$/);
+  const m = path.match(/^\/api\/bookings\/(\d+)\/(cancel|slip|resend-email)$/);
   if (m) {
     const u = await requireUser(env, request);
     const b = await env.DB.prepare('SELECT * FROM bookings WHERE id = ? AND user_id = ?').bind(Number(m[1]), u.id).first();
@@ -134,6 +134,16 @@ export async function handleBookings(request, env, ctx, url, path) {
     }
 
     if (m[2] === 'slip' && method === 'GET') return serveSlip(env, b);
+
+    // Customer asks for the latest email about this booking again (e.g. confirmation went to spam).
+    if (m[2] === 'resend-email' && method === 'POST') {
+      if (!['pending', 'approved', 'confirmed'].includes(b.status)) throw bad('There is no email to resend for this booking.');
+      await hit(env, `resend:user:${u.id}`, 3);
+      const which = statusEmail(b);
+      const r = await which.send(env, await getSettings(env), u.email, b);
+      if (!r.ok) throw new HttpError(502, "We couldn't send the email right now. Try again later or contact us.", 'email_failed');
+      return json({ ok: true, sent: which.label, to: u.email });
+    }
 
     if (m[2] === 'slip' && method === 'POST') {
       await expireUnpaid(env);

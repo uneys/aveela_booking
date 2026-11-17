@@ -83,6 +83,7 @@
     }
     const actions = [];
     if (b.hasSlip) actions.push(`<a class="btn btn-ghost btn-sm" href="/api/bookings/${b.id}/slip" target="_blank" rel="noopener">View my slip</a>`);
+    if (['pending', 'approved', 'confirmed'].includes(b.status)) actions.push(`<button class="btn btn-ghost btn-sm" type="button" data-resend="${b.id}">Email me this again</button>`);
     if (b.status === 'pending' || b.status === 'approved') actions.push(`<button class="btn btn-danger btn-sm" type="button" data-cancel="${b.id}">Cancel request</button>`);
     return `<article class="bk">
       <div class="bk-head"><h3>${esc(b.eventType)} · ${esc(A.fmtDate(b.date, { weekday: 'long', month: 'long' }))}</h3>${A.chip(b.status)}</div>
@@ -134,6 +135,11 @@
         .then(() => { m.close(); A.toast('Request cancelled.'); dashboard(); })
         .catch((e) => A.toast(e.message, 'error')));
     }));
+
+    app.querySelectorAll('[data-resend]').forEach((btn) => btn.addEventListener('click', () =>
+      A.busy(btn, 'Sending…', () => A.api('POST', `/api/bookings/${btn.dataset.resend}/resend-email`, {}))
+        .then((r) => { A.toast(`Sent to ${r.to}. Check your spam folder if you don't see it.`); btn.textContent = 'Sent'; btn.disabled = true; })
+        .catch((e) => A.toast(e.message, 'error'))));
 
     app.querySelectorAll('[data-slip]').forEach((input) => input.addEventListener('change', async () => {
       const file = input.files[0];

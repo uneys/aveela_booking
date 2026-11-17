@@ -20,11 +20,11 @@ It deploys from GitHub: every push to `main` is tested and published automatical
 | Cloudflare Workers | 100,000 requests a day | Hosting for the site and API |
 | Cloudflare D1 | Daily read/write allowance, 5 GB | Bookings, accounts, settings |
 | Cloudflare KV | 1,000 writes a day | One write per bank slip upload |
-| Resend (email) | 3,000 emails a month, 100 a day | Needs a domain you own |
+| Gmail (email) | 500 recipients a day (Workspace: 2,000) | Needs an App Password. Or use Resend: 3,000 emails a month, needs your own domain |
 | Google sign-in | Free | |
 | Apple sign-in | **US$99 a year** | Apple Developer Program. Optional: the Apple button only appears once you add the keys |
 
-Cloudflare's own email sending only reaches arbitrary customers on the paid Workers plan, which is why email goes through Resend.
+Cloudflare's own email sending only reaches arbitrary customers on the paid Workers plan, which is why email goes through Gmail (or Resend).
 
 ---
 
@@ -138,7 +138,7 @@ If you connected the repository under **Workers & Pages → Pages → Connect to
    - `MAIL_FROM` (Text): e.g. `Aveela Event Space <bookings@your-domain.com>`
    - `PEPPER` (**Secret**): at least 32 random characters. Never change or lose it
    - `SETUP_TOKEN` (**Secret**): a long random string
-   - Later, as needed: `RESEND_API_KEY`, `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET` and the `APPLE_…` secrets (all **Secret**)
+   - Later, as needed: `GMAIL_USER` + `GMAIL_APP_PASSWORD` (section 2), `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET` and the `APPLE_…` secrets (all **Secret**)
 5. **Create the tables**: Storage & databases → D1 → `aveela` → **Console**. Paste the whole of `migrations/0001_initial.sql` and run it. For future migrations, paste each new file the same way.
 6. **Redeploy**: bindings and variables only apply to new deployments. Go to Deployments → the latest one → ⋯ → **Retry deployment**.
 7. Open `https://aveela.pages.dev/api/health`. When it shows `"ok":true`, go to `/admin` to create the master admin, then delete `SETUP_TOKEN`.
@@ -174,21 +174,48 @@ To re-run after fixing: **Actions → Test and deploy → Run workflow**.
 | *Setup is turned off. Set the SETUP_TOKEN secret first* | Add the `SETUP_TOKEN` secret (step 5), then reload /admin. |
 | *Online booking isn't available right now* on the home page | Open `/api/health` to see which setting is missing. |
 | Google/Apple sign-in fails, or email links point to the wrong site | `APP_URL` must exactly match your site address, and the redirect URL in Google/Apple must use the same address. |
-| No emails arrive | Add `RESEND_API_KEY` and set `MAIL_FROM` to an address on the domain you verified in Resend. Check Resend's dashboard → Logs. |
+| No emails arrive | Admin → Settings → Email → **Send test email**. It shows the exact problem. *Gmail rejected the sign-in* means use an App Password and check `GMAIL_USER`. Also check the customer's spam folder, then use **Resend … email** on the booking. |
+| *Gmail daily sending limit reached* | Free Gmail allows 500 recipients a day. It resets within 24 hours. |
 
 Live error logs: Cloudflare → Workers & Pages → aveela → **Logs**.
 
 ---
 
-## 2. Email (Resend)
+## 2. Email (Gmail, or Resend)
 
-Without this the site still works, but no emails go out (they are written to the Worker logs instead).
+Without this the site still works, but no emails go out. They're written to the logs instead, and `/api/health` will say so.
+
+### Option A: send from a Gmail account (easiest)
+
+1. Use the Gmail (or Google Workspace) account the venue should send from, e.g. `aveela.venue@gmail.com`.
+2. Turn on **2-Step Verification**: [myaccount.google.com/security](https://myaccount.google.com/security).
+3. Create an **App Password**: [myaccount.google.com/apppasswords](https://myaccount.google.com/apppasswords). Name it "Aveela website" and copy the 16-letter password. You can't use your normal Gmail password.
+4. Add these in Cloudflare (Pages or Worker → Settings → Variables and Secrets):
+   - `GMAIL_USER` (Text): the Gmail address
+   - `GMAIL_APP_PASSWORD` (**Secret**): the 16-letter app password (spaces are fine)
+   - `MAIL_FROM` (Text, optional): sets the name customers see, e.g. `Aveela Event Space <aveela.venue@gmail.com>`
+5. **Redeploy** (Pages: Deployments → latest → ⋯ → Retry deployment).
+6. In the admin panel, open **Settings → Email**. It should say *Sending through Gmail*. Click **Send test email**.
+
+A free Gmail account can send to 500 recipients a day (Workspace: 2,000). Emails come from the Gmail address, and customers' replies go to it. If you change the Google password, Google cancels app passwords, so make a new one and update the secret.
+
+### Option B: Resend (needs your own domain)
 
 1. Sign up at [resend.com](https://resend.com), add your domain and add the DNS records it shows you.
-2. Create an API key and add it as the secret `RESEND_API_KEY` (Cloudflare → aveela → Settings → Variables and Secrets).
-3. In `wrangler.jsonc` set `MAIL_FROM`, e.g. `"Aveela Event Space <bookings@aveela.mv>"` (must be on the domain you verified), and commit.
+2. Create an API key and add it as the secret `RESEND_API_KEY`.
+3. Set `MAIL_FROM`, e.g. `Aveela Event Space <bookings@aveela.mv>` (on the domain you verified), and redeploy.
 
-Emails sent: confirm your email, password reset, request received, approved with payment details, declined, slip rejected, booking confirmed, cancelled by venue, plus alerts to the venue for new requests and uploaded slips.
+If both are set, Gmail is used. Add the variable `EMAIL_PROVIDER` = `resend` to force Resend.
+
+### Which emails are sent
+
+Confirm your email, password reset, request received, approved with payment details, declined, new slip needed, booking confirmed and cancelled by venue. The venue's alert email also gets new requests and uploaded slips.
+
+### Resending emails
+
+- **Admin panel:** open any booking and click **Resend … email**. It resends the email that matches the booking's status (request received, payment details, confirmation, declined or cancellation) and tells you right away whether it was delivered to the mail server or what went wrong.
+- **Customers:** on *My bookings*, **Email me this again** resends their latest email for a pending, approved or confirmed booking (up to 3 times per 15 minutes). The *Send the link again* button resends the email-confirmation link.
+- Every admin resend and test email is recorded in the activity log.
 
 ---
 
@@ -296,7 +323,7 @@ src/index.js            Worker entry: routing, security headers, hourly cleanup
 src/routes/auth.js      Customer accounts, Google, Apple, verification, reset
 src/routes/bookings.js  Availability, requests, slip upload
 src/routes/admin.js     Admin panel API, admins, settings, audit log
-src/lib/                Hashing, sessions, rate limits, email
+src/lib/                Hashing, sessions, rate limits, email (Gmail SMTP and Resend)
 public/                 Website, account page (/account), admin panel (/admin)
 functions/              Runs the same API on Cloudflare Pages
 migrations/              Database tables and default settings (D1 migrations)

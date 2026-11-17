@@ -5,6 +5,7 @@ import { expireUnpaid, now } from './lib/core.js';
 import { handleAuth } from './routes/auth.js';
 import { handleBookings } from './routes/bookings.js';
 import { handleAdmin } from './routes/admin.js';
+import { emailProvider } from './lib/email.js';
 
 const DASH = 'Cloudflare dashboard → Workers & Pages → aveela → Settings';
 const BIND = 'Cloudflare dashboard → Workers & Pages → aveela → Settings → Bindings';
@@ -23,7 +24,7 @@ async function health(env, url) {
   const checks = {
     database: !!env.DB, slipStorage: !!env.SLIPS, pepper: !!(env.PEPPER && env.PEPPER.length >= 32),
     appUrl: env.APP_URL || null, appUrlMatches: !!env.APP_URL && env.APP_URL.replace(/\/+$/, '') === url.origin,
-    tables: false, email: !!env.RESEND_API_KEY, google: !!(env.GOOGLE_CLIENT_ID && env.GOOGLE_CLIENT_SECRET),
+    tables: false, email: emailProvider(env), google: !!(env.GOOGLE_CLIENT_ID && env.GOOGLE_CLIENT_SECRET),
     apple: !!(env.APPLE_CLIENT_ID && env.APPLE_TEAM_ID && env.APPLE_KEY_ID && env.APPLE_PRIVATE_KEY),
   };
   const problems = [];
@@ -33,7 +34,7 @@ async function health(env, url) {
   }
   const p = setupProblem(env); if (p) problems.unshift(p);
   if (env.APP_URL && !checks.appUrlMatches) problems.push(`APP_URL in wrangler.jsonc is ${env.APP_URL} but this site is ${url.origin}. Links in emails and Google/Apple sign-in need them to match.`);
-  if (!checks.email) problems.push('Emails are not being sent: add the RESEND_API_KEY secret (optional, see README section 2).');
+  if (!checks.email) problems.push('Emails are not being sent: add the GMAIL_USER and GMAIL_APP_PASSWORD secrets (or RESEND_API_KEY). See README section 2.');
   return json({ ok: problems.filter((x) => !x.startsWith('Emails')).length === 0, checks, problems });
 }
 

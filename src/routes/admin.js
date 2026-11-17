@@ -1,12 +1,12 @@
 // Vendor admin panel API. Every route here needs an admin session, except state/setup/login.
-import { json, readJson, bad, unauthorized, forbidden, notFound, conflict, clientIp } from '../lib/http.js';
+import { json, readJson, bad, unauthorized, forbidden, notFound, conflict, clientIp, HttpError } from '../lib/http.js';
 import { hashPassword, verifyPassword, dummyVerify, validPrehash, timingSafeEqual } from '../lib/crypto.js';
 import {
   now, getSettings, SETTING_DEFAULTS, NUMERIC_SETTINGS, createSession, readSession, destroySession, destroyAllSessions,
   hit, peek, clearHits, audit, expireUnpaid, findClashes, newRef, isDate,
 } from '../lib/core.js';
 import { publicBooking, serveSlip } from './bookings.js';
-import { mail } from '../lib/email.js';
+import { mail, statusEmail, emailProvider } from '../lib/email.js';
 
 const USERNAME_RE = /^[a-z0-9._-]{3,32}$/;
 const LOGIN_LIMIT_ACCT = 5;
@@ -172,7 +172,7 @@ export async function handleAdmin(request, env, ctx, url, path) {
     return json({ booking: publicBooking(b) }, 201);
   }
 
-  const bm = path.match(/^\/api\/admin\/bookings\/(\d+)(?:\/(approve|reject|confirm|reject-slip|cancel|slip))?$/);
+  const bm = path.match(/^\/api\/admin\/bookings\/(\d+)(?:\/(approve|reject|confirm|reject-slip|cancel|slip|resend-email))?$/);
   if (bm) {
     const a = await requireAdmin(env, request);
     const id = Number(bm[1]);
@@ -184,6 +184,15 @@ export async function handleAdmin(request, env, ctx, url, path) {
       return json({ booking: adminBooking(b), clashes });
     }
     if (action === 'slip' && method === 'GET') return serveSlip(env, b);
+    if (action === 'resend-email' && method === 'POST') {
+      const which = statusEmail(b);
+      if (!which || !b.u_email) throw bad('There is no email to resend for this booking.');
+      await hit(env, `resend:admin:${a.id}`, 20);
+      const r = await which.send(env, await getSettings(env), b.u_email, b);
+      await audit(env, a.id, 'resend_email', `${b.ref}: ${which.label}${r.ok ? '' : ' (failed)'}`, ip);
+      if (!r.ok) throw new HttpError(502, r.error || 'The email could not be sent.', 'email_failed');
+      return json({ ok: true, sent: which.label, to: b.u_email, provider: r.provider });
+    }
     if (method !== 'POST' || !action) throw notFound();
 
     const body = await readJson(request);
@@ -303,7 +312,21 @@ export async function handleAdmin(request, env, ctx, url, path) {
 
   if (path === '/api/admin/settings' && method === 'GET') {
     await requireAdmin(env, request);
-    return json({ settings: await getSettings(env) });
+    const provider = emailProvider(env);
+    return json({ settings: await getSettings(env), email: { provider, from: provider === 'gmail' ? env.GMAIL_USER : provider === 'resend' ? env.MAIL_FROM : null } });
+  }
+
+  if (path === '/api/admin/test-email' && method === 'POST') {
+    const a = await requireAdmin(env, request);
+    const body = await readJson(request);
+    const s = await getSettings(env);
+    const to = String(body.to || s.notify_email || a.email || '').trim();
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(to)) throw bad('Enter the email address to send the test to.');
+    await hit(env, `testmail:${a.id}`, 5);
+    const r = await mail.test(env, to);
+    await audit(env, a.id, 'test_email', `${to}${r.ok ? '' : ' (failed)'}`, ip);
+    if (!r.ok) throw new HttpError(502, r.error || 'The email could not be sent.', 'email_failed');
+    return json({ ok: true, to, provider: r.provider });
   }
 
   if (path === '/api/admin/settings' && method === 'POST') {

@@ -265,8 +265,14 @@
       ${pending.length ? `<div class="warn">Other requests overlap these hours: ${pending.map((c) => esc(c.ref)).join(', ')}. Approving this one will block them from being approved.</div>` : ''}
       ${b.hasSlip ? `<h3 style="font:600 15px var(--sans);margin:18px 0 0">Bank slip <span class="muted">uploaded ${esc(A.fmtWhen(b.slipAt))}</span></h3>
         <a href="${slipUrl}" target="_blank" rel="noopener"><img class="slip-view" src="${slipUrl}" alt="Bank slip for ${esc(b.ref)}"></a>` : ''}
-      ${actions}`;
+      ${actions}
+      ${b.customer && RESEND_LABEL[b.status] ? `<div class="actbox"><p class="hint" style="margin:0">Customer didn't get it, or it went to spam?</p>
+        <div><button class="btn btn-ghost" type="button" id="resend">Resend ${esc(RESEND_LABEL[b.status])} email</button></div></div>` : ''}`;
     d.querySelector('.modal-x').addEventListener('click', closeDrawer);
+    const rs = d.querySelector('#resend');
+    if (rs) rs.addEventListener('click', () => A.busy(rs, 'Sending…', () => A.api('POST', `/api/admin/bookings/${b.id}/resend-email`, {}))
+      .then((r) => A.toast(`Sent the ${r.sent} email to ${r.to}.`))
+      .catch((e) => A.toast(e.message, 'error')));
     // CSP blocks inline handlers, so wire the PDF fallback here.
     const img = d.querySelector('.slip-view');
     if (img) { img.addEventListener('error', () => { const s = document.createElement('span'); s.className = 'btn btn-ghost btn-sm'; s.textContent = 'Open the slip in a new tab'; img.replaceWith(s); }); }
@@ -287,6 +293,8 @@
       } catch (ex) { err.textContent = ex.message; }
     }));
   }
+
+  const RESEND_LABEL = { pending: 'request received', approved: 'payment details', confirmed: 'confirmation', rejected: 'declined', cancelled: 'cancellation' };
 
   // ---------- block time ----------
 
@@ -390,7 +398,7 @@
 
   async function settingsView() {
     const m = main();
-    const { settings: s } = await A.api('GET', '/api/admin/settings');
+    const { settings: s, email } = await A.api('GET', '/api/admin/settings');
     const f = (k, label, type = 'text', extra = '') => `<label class="fld"><span>${esc(label)}</span><input name="${k}" type="${type}" value="${esc(s[k])}" ${extra}></label>`;
     m.innerHTML = `<h1>Settings</h1><p class="sub">Prices, opening hours and the bank details customers see after you approve them.</p>
       <form class="form" novalidate id="sform" style="max-width:760px">
@@ -403,9 +411,21 @@
         <div class="panel"><h2>Bank transfer details</h2><div class="grid2">
           ${f('bank_name', 'Bank')}${f('account_name', 'Account name')}${f('account_number', 'Account number')}
         </div><label class="fld" style="margin-top:14px"><span>Payment instructions</span><textarea name="payment_note" maxlength="400">${esc(s.payment_note)}</textarea></label></div>
-        <div class="panel"><h2>Notifications</h2>${f('notify_email', 'Email for new requests and uploaded slips', 'email')}</div>
+        <div class="panel"><h2>Email</h2>
+          <p style="margin:0 0 14px">${email.provider === 'gmail' ? `Sending through <strong>Gmail</strong> as ${esc(email.from)}.`
+            : email.provider === 'resend' ? `Sending through <strong>Resend</strong> as ${esc(email.from)}.`
+            : '<strong>Emails are not being sent.</strong> Add the GMAIL_USER and GMAIL_APP_PASSWORD secrets in Cloudflare (see the README).'}</p>
+          ${f('notify_email', 'Email for new requests and uploaded slips', 'email')}
+          <div class="toolbar" style="margin:14px 0 0;align-items:flex-end">
+            <label class="fld" style="flex:1"><span>Send a test email to</span><input id="testTo" type="email" value="${esc(s.notify_email || me.email || '')}"></label>
+            <button class="btn btn-ghost" type="button" id="testBtn">Send test email</button>
+          </div></div>
         <p class="form-err" role="alert"></p><div><button class="btn btn-primary" type="submit">Save settings</button></div>
       </form>`;
+    const tb = document.getElementById('testBtn');
+    tb.addEventListener('click', () => A.busy(tb, 'Sending…', () => A.api('POST', '/api/admin/test-email', { to: document.getElementById('testTo').value }))
+      .then((r) => A.toast(`Test email sent to ${r.to}. Check the inbox (and spam).`))
+      .catch((e) => A.toast(e.message, 'error')));
     formSubmit(document.getElementById('sform'), 'Saving…', async (v) => {
       const r = await A.api('POST', '/api/admin/settings', v);
       settings = r.settings; A.toast('Settings saved.');
@@ -418,7 +438,7 @@
     const m = main();
     m.innerHTML = '<h1>Activity log</h1><p class="sub">The last 200 admin actions, including failed sign-ins.</p><div id="log"><p class="muted">Loading…</p></div>';
     const { entries } = await A.api('GET', '/api/admin/audit');
-    const labels = { login: 'Signed in', login_failed: 'Failed sign-in', approve: 'Approved', reject: 'Rejected', confirm: 'Confirmed payment', 'reject-slip': 'Rejected slip', cancel: 'Cancelled', block: 'Blocked time', settings: 'Changed settings', admin_added: 'Added admin', admin_disabled: 'Disabled admin', admin_updated: 'Updated admin', admin_password_reset: 'Reset admin password', admin_removed: 'Removed admin', master_transferred: 'Handed over master', password_changed: 'Changed own password', setup: 'Setup' };
+    const labels = { login: 'Signed in', login_failed: 'Failed sign-in', approve: 'Approved', reject: 'Rejected', confirm: 'Confirmed payment', 'reject-slip': 'Rejected slip', cancel: 'Cancelled', block: 'Blocked time', settings: 'Changed settings', admin_added: 'Added admin', admin_disabled: 'Disabled admin', admin_updated: 'Updated admin', admin_password_reset: 'Reset admin password', admin_removed: 'Removed admin', master_transferred: 'Handed over master', password_changed: 'Changed own password', setup: 'Setup', resend_email: 'Resent email', test_email: 'Sent test email' };
     document.getElementById('log').innerHTML = entries.length ? `<table class="table" style="display:table"><thead><tr><th>When</th><th>Who</th><th>What</th><th>Details</th><th>IP</th></tr></thead><tbody>
       ${entries.map((e) => `<tr style="cursor:default"><td class="muted">${esc(A.fmtWhen(e.at))}</td><td>${esc(e.username || '–')}</td><td>${esc(labels[e.action] || e.action)}</td><td>${esc(e.detail)}</td><td class="muted">${esc(e.ip)}</td></tr>`).join('')}
       </tbody></table>` : '<div class="panel">No activity yet.</div>';

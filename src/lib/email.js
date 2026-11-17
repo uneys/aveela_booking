@@ -1,26 +1,58 @@
-// Transactional email through Resend (https://resend.com, free plan: 100 emails/day).
-// Without RESEND_API_KEY, emails are logged instead of sent, so local testing still works.
+// Transactional email. Two ways to send, picked automatically:
+//   1. Gmail: set GMAIL_USER and GMAIL_APP_PASSWORD (sends through smtp.gmail.com, 500 recipients/day free)
+//   2. Resend: set RESEND_API_KEY (needs your own domain)
+// With neither, emails are written to the logs instead of sent, so local testing still works.
+// Set EMAIL_PROVIDER=gmail or EMAIL_PROVIDER=resend to force one when both are configured.
 import { fmtDate, fmtHour, money } from './core.js';
+import { buildMime, smtpSend } from './smtp.js';
 
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 
+export function emailProvider(env) {
+  const gmail = !!(env.GMAIL_USER && env.GMAIL_APP_PASSWORD);
+  const resend = !!env.RESEND_API_KEY;
+  const want = String(env.EMAIL_PROVIDER || '').toLowerCase();
+  if (want === 'gmail' && gmail) return 'gmail';
+  if (want === 'resend' && resend) return 'resend';
+  return gmail ? 'gmail' : resend ? 'resend' : null;
+}
+
+// "Aveela Event Space <bookings@x.com>" -> { name, addr }
+function parseFrom(v) {
+  const m = String(v || '').match(/^\s*"?([^"<]*?)"?\s*<([^>]+)>\s*$/);
+  return m ? { name: m[1].trim(), addr: m[2].trim() } : { name: '', addr: String(v || '').trim() };
+}
+
 export async function sendEmail(env, { to, subject, html, text, replyTo }) {
-  if (!to) return { skipped: true };
-  if (!env.RESEND_API_KEY) {
-    console.log(`[email not sent: RESEND_API_KEY missing] to=${to} subject=${subject}\n${text}`);
-    return { skipped: true };
+  if (!to) return { ok: false, skipped: true, error: 'No email address.' };
+  const provider = emailProvider(env);
+  if (!provider) {
+    console.log(`[email not sent: no email provider set] to=${to} subject=${subject}\n${text}`);
+    return { ok: false, skipped: true, error: 'Email sending is not set up yet (add the Gmail or Resend secrets).' };
   }
+  const from = parseFrom(env.MAIL_FROM);
   try {
+    if (provider === 'gmail') {
+      const user = String(env.GMAIL_USER).trim();
+      // Gmail always sends as the signed-in account, so only the display name comes from MAIL_FROM.
+      const raw = buildMime({ fromName: from.name || 'Aveela Event Space', fromAddr: user, to, subject, text, html, replyTo });
+      await smtpSend({ user, pass: String(env.GMAIL_APP_PASSWORD).replace(/\s+/g, ''), from: user, to, raw });
+      return { ok: true, provider };
+    }
     const res = await fetch('https://api.resend.com/emails', {
       method: 'POST',
       headers: { authorization: `Bearer ${env.RESEND_API_KEY}`, 'content-type': 'application/json' },
       body: JSON.stringify({ from: env.MAIL_FROM, to: [to], subject, html, text, reply_to: replyTo || undefined }),
     });
-    if (!res.ok) console.log('Resend error', res.status, await res.text());
-    return { ok: res.ok };
+    if (!res.ok) {
+      const body = await res.text();
+      console.log('Resend error', res.status, body);
+      return { ok: false, provider, error: `Resend refused the email (${res.status}). ${body.slice(0, 200)}` };
+    }
+    return { ok: true, provider };
   } catch (e) {
-    console.log('Resend failed', e && e.message);
-    return { ok: false };
+    console.log(`${provider} send failed`, e && e.message);
+    return { ok: false, provider, error: String((e && e.message) || e) };
   }
 }
 
@@ -56,6 +88,18 @@ function bookingTable(s, b) {
 
 function bookingText(s, b) {
   return `Reference: ${b.ref}\nEvent: ${b.event_type}\nDate: ${fmtDate(b.date)}\nTime: ${fmtHour(b.start_hour)} to ${fmtHour(b.end_hour)}\nGuests: ${b.guests}${b.amount ? `\nAmount: ${money(s, b.amount)}` : ''}`;
+}
+
+// Which email goes with a booking's current status (used by the "resend email" buttons).
+export function statusEmail(b) {
+  switch (b.status) {
+    case 'pending': return { label: 'request received', send: mail.requested };
+    case 'approved': return b.slip_key ? { label: 'new slip request', send: mail.slipRejected } : { label: 'payment details', send: mail.approved };
+    case 'confirmed': return { label: 'booking confirmation', send: mail.confirmed };
+    case 'rejected': return { label: 'declined', send: mail.rejected };
+    case 'cancelled': return { label: 'cancellation', send: mail.cancelledByVenue };
+    default: return null;
+  }
 }
 
 export const mail = {
@@ -128,6 +172,13 @@ export const mail = {
       to: s.notify_email, subject: `New booking request ${b.ref} for ${fmtDate(b.date)}`, replyTo: customer.email,
       html: layout(env, 'New booking request', p(`${esc(customer.name)} (${esc(customer.email)}) asked for:`) + bookingTable(s, b) + (b.notes ? p(`Notes: ${esc(b.notes)}`) : '') + button(`${env.APP_URL}/admin`, 'Open admin panel')),
       text: `${customer.name} (${customer.email}) asked for:\n${bookingText(s, b)}\n${b.notes ? 'Notes: ' + b.notes : ''}\n\n${env.APP_URL}/admin`,
+    });
+  },
+  test(env, to) {
+    return sendEmail(env, {
+      to, subject: 'Test email from your Aveela booking site',
+      html: layout(env, 'Email is working', p('This is a test from the admin panel. If you can read this, booking emails will reach your customers.')),
+      text: 'This is a test from the admin panel. If you can read this, booking emails will reach your customers.',
     });
   },
   vendorSlip(env, s, b, customer) {
