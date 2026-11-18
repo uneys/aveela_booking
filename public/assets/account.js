@@ -211,7 +211,8 @@
     if (q.get('verified')) A.toast('Email confirmed. You can now send booking requests.');
     if (q.get('verify') === 'expired') A.toast('That confirmation link has expired or was already used. Send a new one below.', 'error');
     const oauthMsg = q.get('oauth') === 'failed' ? `Sign-in with ${q.get('provider') === 'apple' ? 'Apple' : 'Google'} didn't complete. Try again or use your email.`
-      : q.get('oauth') === 'unavailable' ? "That sign-in option isn't set up yet. Use your email instead." : '';
+      : q.get('oauth') === 'unavailable' ? "That sign-in option isn't set up yet. Use your email instead."
+      : q.get('oauth') === 'suspended' ? 'This account is suspended. Contact the venue if you think this is a mistake.' : '';
     if (q.toString()) cleanUrl();
     if (!A.me) return signedOut(oauthMsg || undefined);
     if (oauthMsg) A.toast(oauthMsg, 'error');

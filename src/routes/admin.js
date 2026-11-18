@@ -4,6 +4,7 @@ import { hashPassword, verifyPassword, dummyVerify, validPrehash, timingSafeEqua
 import {
   now, getSettings, SETTING_DEFAULTS, NUMERIC_SETTINGS, createSession, readSession, destroySession, destroyAllSessions,
   hit, peek, clearHits, audit, expireUnpaid, findClashes, newRef, isDate, sessionEndReason, venueToday, describeSlot,
+  gapHours, FREE_GUARD, guardArgs,
 } from '../lib/core.js';
 import { publicBooking, serveSlip, readSlipUpload, storeSlip, EVENT_TYPES, SOURCES } from './bookings.js';
 import { mail, statusEmail, emailProvider } from '../lib/email.js';
@@ -56,6 +57,16 @@ function adminBooking(b) {
   }
   return { ...publicBooking(b), customer, decidedBy: b.a_name || null, createdBy: b.c_name || null };
 }
+function adminUser(u) {
+  const methods = [u.password_hash && 'Email', u.google_sub && 'Google', u.apple_sub && 'Apple'].filter(Boolean);
+  return {
+    id: u.id, name: u.name, email: u.email, phone: u.phone, verified: !!u.email_verified, signInWith: methods,
+    hasAccount: methods.length > 0, createdAt: u.created_at, lastLoginAt: u.last_login_at || null,
+    suspended: !!u.suspended, suspendedReason: u.suspended_reason || '', suspendedAt: u.suspended_at || null, suspendedBy: u.sb_name || null,
+    bookings: u.n_bookings ?? null, upcoming: u.n_upcoming ?? null,
+  };
+}
+
 const customerEmail = (b) => b.u_email || b.customer_email || '';
 
 const BOOKING_SELECT = `SELECT b.*, u.name AS u_name, u.email AS u_email, u.phone AS u_phone,
@@ -242,11 +253,13 @@ export async function handleAdmin(request, env, ctx, url, path) {
     }
     const t = now();
     const payBy = status === 'approved' && s.pay_within_hours > 0 ? t + s.pay_within_hours * 3600 * 1000 : null;
+    const g = await gapHours(env);
     const b = await env.DB.prepare(`INSERT INTO bookings (ref, user_id, event_type, date, start_hour, end_hour, guests, notes, status, amount, vendor_note,
         pay_by, decided_by, created_by, source, customer_name, customer_email, customer_phone, created_at, updated_at)
-      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) RETURNING *`)
+      SELECT ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,? WHERE ? = 'pending' OR ${FREE_GUARD} RETURNING *`)
       .bind(newRef(), userId, eventType, date, start, end, guests, notes, status, amount, noteOf(body), payBy,
-        status === 'pending' ? null : a.id, a.id, source, name, email, phone, t, t).first();
+        status === 'pending' ? null : a.id, a.id, source, name, email, phone, t, t, status, ...guardArgs(0, date, start, end, g)).first();
+    if (!b) throw conflict('Those hours were just taken by another booking. Pick other hours.', 'taken');
     let emailed = null;
     if (email && body.notify) {
       const send = status === 'pending' ? mail.requested : status === 'approved' ? mail.approved : mail.confirmed;
@@ -266,7 +279,9 @@ export async function handleAdmin(request, env, ctx, url, path) {
     if (clashes.length) throw conflict(`That clashes with ${clashes.map((c) => c.ref).join(', ')}.`);
     const t = now();
     const b = await env.DB.prepare(`INSERT INTO bookings (ref, user_id, event_type, date, start_hour, end_hour, guests, notes, status, decided_by, created_at, updated_at)
-      VALUES (?,NULL,'Blocked',?,?,?,0,?,'blocked',?,?,?) RETURNING *`).bind(newRef(), date, start, end, noteOf({ note: body.reason }), a.id, t, t).first();
+      SELECT ?,NULL,'Blocked',?,?,?,0,?,'blocked',?,?,? WHERE ${FREE_GUARD} RETURNING *`)
+      .bind(newRef(), date, start, end, noteOf({ note: body.reason }), a.id, t, t, ...guardArgs(0, date, start, end, await gapHours(env))).first();
+    if (!b) throw conflict('Those hours were just taken by another booking.');
     await audit(env, a.id, 'block', `${b.ref} ${date} ${start}-${end}`, ip);
     return json({ booking: publicBooking(b) }, 201);
   }
@@ -340,9 +355,13 @@ export async function handleAdmin(request, env, ctx, url, path) {
       const amount = body.amount === undefined || body.amount === '' ? (ch ? (end - start) * s.hourly_rate : b.amount) : Number(body.amount);
       if (!Number.isInteger(amount) || amount < 0 || amount > 100000000) throw bad('Enter the amount as a whole number.');
       const payBy = s.pay_within_hours > 0 ? t + s.pay_within_hours * 3600 * 1000 : null;
-      updated = await env.DB.prepare("UPDATE bookings SET status = 'approved', date = ?, start_hour = ?, end_hour = ?, guests = ?, amount = ?, vendor_note = ?, pay_by = ?, decided_by = ?, updated_at = ? WHERE id = ? AND status = 'pending' RETURNING *")
-        .bind(date, start, end, guests, amount, note, payBy, a.id, t, id).first();
-      if (!updated) throw conflict('This booking changed in the meantime. Reload and try again.');
+      updated = await env.DB.prepare(`UPDATE bookings SET status = 'approved', date = ?, start_hour = ?, end_hour = ?, guests = ?, amount = ?, vendor_note = ?, pay_by = ?, decided_by = ?, updated_at = ?
+          WHERE id = ? AND status = 'pending' AND ${FREE_GUARD} RETURNING *`)
+        .bind(date, start, end, guests, amount, note, payBy, a.id, t, id, ...guardArgs(id, date, start, end, await gapHours(env))).first();
+      if (!updated) {
+        const again = await findClashes(env, date, start, end, id);
+        throw conflict(again.length ? `Those hours were just taken by ${again.map((c) => c.ref).join(', ')}. Pick other hours.` : 'This booking changed in the meantime. Reload and try again.');
+      }
       if (ch) await audit(env, a.id, 'reschedule', `${b.ref}: ${ch.from} → ${describeSlot(updated)}, ${guests} guests`, ip);
       if (email) ctx.waitUntil(mail.approved(env, s, email, updated, ch && ch.timeChanged ? ch.from : null));
     } else if (action === 'reject') {
@@ -375,6 +394,61 @@ export async function handleAdmin(request, env, ctx, url, path) {
     }
     await audit(env, a.id, action, `${b.ref}${note ? ': ' + note : ''}`, ip);
     return json({ booking: adminBooking(await loadBooking(env, id)) });
+  }
+
+  // ---------- customers ----------
+
+  if (path === '/api/admin/users' && method === 'GET') {
+    await requireAdmin(env, request);
+    const q = (url.searchParams.get('q') || '').trim().slice(0, 80);
+    const filter = url.searchParams.get('filter') || '';
+    const where = [];
+    const args = [];
+    if (q) { where.push('(u.email LIKE ? OR u.name LIKE ? OR u.phone LIKE ?)'); args.push(`%${q}%`, `%${q}%`, `%${q}%`); }
+    if (filter === 'suspended') where.push('u.suspended = 1');
+    if (filter === 'unverified') where.push('u.email_verified = 0 AND u.suspended = 0');
+    if (filter === 'noaccount') where.push('u.password_hash IS NULL AND u.google_sub IS NULL AND u.apple_sub IS NULL');
+    const { results } = await env.DB.prepare(`SELECT u.*, ad.name AS sb_name,
+        (SELECT COUNT(*) FROM bookings b WHERE b.user_id = u.id) AS n_bookings,
+        (SELECT COUNT(*) FROM bookings b WHERE b.user_id = u.id AND b.status IN ('pending','approved','slip_uploaded','confirmed') AND b.date >= date('now')) AS n_upcoming
+      FROM users u LEFT JOIN admins ad ON ad.id = u.suspended_by ${where.length ? 'WHERE ' + where.join(' AND ') : ''} ORDER BY u.created_at DESC LIMIT 300`).bind(...args).all();
+    const total = await env.DB.prepare('SELECT COUNT(*) AS n, SUM(suspended) AS s FROM users').first();
+    return json({ users: results.map(adminUser), total: total.n, suspended: total.s || 0 });
+  }
+
+  const um = path.match(/^\/api\/admin\/users\/(\d+)(?:\/(suspend|unsuspend))?$/);
+  if (um) {
+    const a = await requireAdmin(env, request);
+    const u = await env.DB.prepare(`SELECT u.*, ad.name AS sb_name FROM users u LEFT JOIN admins ad ON ad.id = u.suspended_by WHERE u.id = ?`).bind(Number(um[1])).first();
+    if (!u) throw notFound('Customer not found.');
+    if (!um[2] && method === 'GET') {
+      const { results } = await env.DB.prepare(`${BOOKING_SELECT} WHERE b.user_id = ? ORDER BY b.date DESC, b.start_hour DESC LIMIT 100`).bind(u.id).all();
+      return json({ user: adminUser(u), bookings: results.map(adminBooking) });
+    }
+    if (method !== 'POST') throw notFound();
+    const body = await readJson(request);
+    if (um[2] === 'suspend') {
+      const reason = noteOf({ note: body.reason });
+      if (!reason) throw bad('Write a short reason. Only staff see it.');
+      if (u.suspended) throw conflict('This account is already suspended.');
+      await env.DB.prepare('UPDATE users SET suspended = 1, suspended_reason = ?, suspended_at = ?, suspended_by = ? WHERE id = ?').bind(reason, now(), a.id, u.id).run();
+      await destroyAllSessions(env, 'user', u.id);
+      await env.DB.prepare('DELETE FROM tokens WHERE user_id = ?').bind(u.id).run();
+      let cancelled = 0;
+      if (body.cancelPending) {
+        const r = await env.DB.prepare("UPDATE bookings SET status = 'cancelled', vendor_note = ?, decided_by = ?, updated_at = ? WHERE user_id = ? AND status = 'pending'")
+          .bind('Cancelled because the account was suspended.', a.id, now(), u.id).run();
+        cancelled = (r.meta && r.meta.changes) || 0;
+      }
+      await audit(env, a.id, 'user_suspended', `${u.email}: ${reason}${cancelled ? ` (${cancelled} pending request${cancelled === 1 ? '' : 's'} cancelled)` : ''}`, ip);
+      return json({ user: adminUser(await env.DB.prepare('SELECT * FROM users WHERE id = ?').bind(u.id).first()), cancelled });
+    }
+    if (um[2] === 'unsuspend') {
+      if (!u.suspended) throw conflict('This account is not suspended.');
+      await env.DB.prepare("UPDATE users SET suspended = 0, suspended_reason = '', suspended_at = NULL, suspended_by = NULL WHERE id = ?").bind(u.id).run();
+      await audit(env, a.id, 'user_unsuspended', u.email, ip);
+      return json({ user: adminUser(await env.DB.prepare('SELECT * FROM users WHERE id = ?').bind(u.id).first()) });
+    }
   }
 
   // ---------- master admin only ----------
@@ -477,6 +551,10 @@ export async function handleAdmin(request, env, ctx, url, path) {
       } else v = v.slice(0, 400);
       stmts.push(env.DB.prepare('INSERT INTO settings (key, value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value = excluded.value').bind(k, v));
       changed.push(k);
+    }
+    if (body.gap_hours !== undefined) {
+      const g = Number(body.gap_hours);
+      if (!Number.isInteger(g) || g < 0 || g > 12) throw bad('Gap between bookings: 0 to 12 hours.');
     }
     if (body.admin_idle_minutes !== undefined) {
       const m = Number(body.admin_idle_minutes);

@@ -185,6 +185,7 @@
     { id: 'payments', label: 'Payments to check', count: 'slip_uploaded' },
     { id: 'upcoming', label: 'Upcoming' },
     { id: 'all', label: 'All bookings' },
+    { id: 'customers', label: 'Customers' },
     { id: 'new', label: 'New booking' },
     { id: 'block', label: 'Block time' },
     { sep: true, master: true },
@@ -238,7 +239,7 @@
     if (!v) id = 'requests';
     document.querySelectorAll('[data-view]').forEach((a) => a.setAttribute('aria-current', a.dataset.view === id ? 'page' : 'false'));
     closeDrawer();
-    ({ requests, payments, upcoming, all, new: newBooking, block, admins, settings: settingsView, activity, password }[id])();
+    ({ requests, payments, upcoming, all, customers, new: newBooking, block, admins, settings: settingsView, activity, password }[id])();
   }
 
   const main = () => document.getElementById('main');
@@ -360,6 +361,7 @@
         <dt>Guests</dt><dd>${b.guests || '–'}</dd>
         <dt>Amount</dt><dd>${b.amount ? esc(A.fmtMoney(cur, b.amount)) : '–'}</dd>
         ${b.customer ? `<dt>Customer</dt><dd>${esc(b.customer.name)}${b.customer.email ? `<br><a href="mailto:${esc(b.customer.email)}">${esc(b.customer.email)}</a>` : ''}${b.customer.phone ? `<br><a href="tel:${esc(b.customer.phone.replace(/[^\d+]/g, ''))}">${esc(b.customer.phone)}</a>` : ''}${!b.customer.email ? '<br><span class="muted">No email, so no automatic emails</span>' : ''}</dd>` : ''}
+        ${b.customer && b.customer.id ? `<dt></dt><dd><button class="linkish" type="button" id="toCustomer" style="color:#3a4f86">View customer and their bookings</button></dd>` : ''}
         ${b.source && b.source !== 'website' ? `<dt>Came in via</dt><dd>${esc(b.source)}${b.createdBy ? `, added by ${esc(b.createdBy)}` : ''}</dd>` : ''}
         ${b.notes ? `<dt>${b.status === 'blocked' ? 'Reason' : 'Their notes'}</dt><dd>${esc(b.notes)}</dd>` : ''}
         ${b.vendorNote ? `<dt>Your note</dt><dd>${esc(b.vendorNote)}</dd>` : ''}
@@ -416,6 +418,9 @@
       });
     }
 
+    const tc = d.querySelector('#toCustomer');
+    if (tc) tc.addEventListener('click', () => openCustomer(b.customer.id));
+
     const as = d.querySelector('#adminSlip');
     if (as) as.addEventListener('change', async () => {
       const file = as.files[0]; if (!file) return;
@@ -454,6 +459,109 @@
   }
 
   const RESEND_LABEL = { pending: 'request received', approved: 'payment details', confirmed: 'confirmation', rejected: 'declined', cancelled: 'cancellation' };
+
+  // ---------- customers ----------
+
+  function customerStatus(u) {
+    if (u.suspended) return '<span class="chip chip-off" style="background:#fdeceb;color:#c0392b">Suspended</span>';
+    if (!u.hasAccount) return '<span class="chip chip-wait">Added by staff</span>';
+    if (!u.verified) return '<span class="chip chip-act">Email not confirmed</span>';
+    return '<span class="chip chip-good">Active</span>';
+  }
+
+  async function customers() {
+    const m = main();
+    m.innerHTML = `<h1>Customers</h1><p class="sub" id="cSub">Everyone with an account, plus customers you added to manual bookings.</p>
+      <div class="toolbar">
+        <label class="fld"><span>Search name, email or phone</span><input type="search" id="cq"></label>
+        <div class="seg" role="tablist" aria-label="Show" style="margin:18px 0 0">
+          <button type="button" role="tab" aria-selected="true" data-f="">All</button>
+          <button type="button" role="tab" aria-selected="false" data-f="suspended">Suspended</button>
+          <button type="button" role="tab" aria-selected="false" data-f="unverified">Not confirmed</button>
+          <button type="button" role="tab" aria-selected="false" data-f="noaccount">Added by staff</button>
+        </div>
+      </div>
+      <div id="clist"><p class="muted">Loading…</p></div>`;
+    let filter = '', q = '', t;
+    async function load() {
+      const box = document.getElementById('clist');
+      try {
+        const r = await A.api('GET', `/api/admin/users?filter=${filter}&q=${encodeURIComponent(q)}`);
+        document.getElementById('cSub').textContent = `${r.total} customer${r.total === 1 ? '' : 's'}${r.suspended ? `, ${r.suspended} suspended` : ''}. Everyone with an account, plus customers you added to manual bookings.`;
+        if (!r.users.length) { box.innerHTML = '<div class="panel"><p style="margin:0">No customers match.</p></div>'; return; }
+        box.innerHTML = `<table class="table"><thead><tr><th>Customer</th><th>Phone</th><th>Signs in with</th><th>Joined</th><th>Last sign-in</th><th>Bookings</th><th>Status</th></tr></thead><tbody>
+          ${r.users.map((u) => `<tr data-uid="${u.id}" tabindex="0"><td><strong>${esc(u.name || '–')}</strong><div class="muted">${esc(u.email)}</div></td>
+            <td>${esc(u.phone || '–')}</td><td>${u.signInWith.length ? esc(u.signInWith.join(', ')) : '<span class="muted">Not signed up</span>'}</td>
+            <td class="muted">${esc(A.fmtWhen(u.createdAt).split(',')[0])}</td><td class="muted">${u.lastLoginAt ? esc(A.fmtWhen(u.lastLoginAt)) : '–'}</td>
+            <td>${u.bookings}${u.upcoming ? `<div class="muted">${u.upcoming} upcoming</div>` : ''}</td><td>${customerStatus(u)}</td></tr>`).join('')}
+          </tbody></table>
+          <div class="cards-admin">${r.users.map((u) => `<article class="bk" data-uid="${u.id}" tabindex="0"><div class="bk-head"><strong>${esc(u.name || u.email)}</strong>${customerStatus(u)}</div>
+            <div class="muted">${esc(u.email)}${u.phone ? ' · ' + esc(u.phone) : ''} · ${u.bookings} booking${u.bookings === 1 ? '' : 's'}</div></article>`).join('')}</div>`;
+        box.querySelectorAll('[data-uid]').forEach((el) => {
+          const open = () => openCustomer(+el.dataset.uid, load);
+          el.addEventListener('click', open);
+          el.addEventListener('keydown', (e) => { if (e.key === 'Enter') open(); });
+        });
+      } catch (e) { box.innerHTML = `<p class="form-err">${esc(e.message)}</p>`; }
+    }
+    m.querySelectorAll('[data-f]').forEach((b) => b.addEventListener('click', () => {
+      m.querySelectorAll('[data-f]').forEach((x) => x.setAttribute('aria-selected', x === b));
+      filter = b.dataset.f; load();
+    }));
+    document.getElementById('cq').addEventListener('input', (e) => { clearTimeout(t); t = setTimeout(() => { q = e.target.value; load(); }, 250); });
+    load();
+  }
+
+  async function openCustomer(id, onChange) {
+    const d = document.getElementById('drawer');
+    d.innerHTML = '<p class="muted">Loading…</p>';
+    d.classList.add('on'); document.getElementById('shade').classList.add('on');
+    let data;
+    try { data = await A.api('GET', `/api/admin/users/${id}`); } catch (e) { d.innerHTML = `<p class="form-err">${esc(e.message)}</p>`; return; }
+    const u = data.user;
+    const pending = data.bookings.filter((b) => b.status === 'pending').length;
+    d.innerHTML = `<button class="modal-x" type="button" aria-label="Close">×</button>
+      <h2>${esc(u.name || u.email)}</h2>${customerStatus(u)}
+      <dl class="kv">
+        <dt>Email</dt><dd><a href="mailto:${esc(u.email)}">${esc(u.email)}</a>${u.verified ? '' : ' <span class="muted">(not confirmed)</span>'}</dd>
+        ${u.phone ? `<dt>Phone</dt><dd><a href="tel:${esc(u.phone.replace(/[^\d+]/g, ''))}">${esc(u.phone)}</a></dd>` : ''}
+        <dt>Signs in with</dt><dd>${u.signInWith.length ? esc(u.signInWith.join(', ')) : 'Not signed up yet (added by staff)'}</dd>
+        <dt>Joined</dt><dd>${esc(A.fmtWhen(u.createdAt))}</dd>
+        <dt>Last sign-in</dt><dd>${u.lastLoginAt ? esc(A.fmtWhen(u.lastLoginAt)) : '–'}</dd>
+        ${u.suspended ? `<dt>Suspended</dt><dd>${esc(A.fmtWhen(u.suspendedAt))}${u.suspendedBy ? ` by ${esc(u.suspendedBy)}` : ''}<br><strong>Reason:</strong> ${esc(u.suspendedReason)}</dd>` : ''}
+      </dl>
+      <h3 style="font:600 15px var(--sans);margin:20px 0 8px">Bookings (${data.bookings.length})</h3>
+      ${data.bookings.length ? `<div style="display:grid;gap:8px">${data.bookings.map((b) => `<button type="button" class="bk" data-bid="${b.id}" style="text-align:left;background:#f7f8fa;border:0;border-radius:12px;padding:12px 14px;cursor:pointer;font:inherit">
+          <div class="bk-head" style="margin:0 0 4px"><strong>${esc(A.fmtDate(b.date))}, ${A.fmtHour(b.start)}–${A.fmtHour(b.end)}</strong>${A.chip(b.status)}</div>
+          <div class="muted">${esc(b.eventType)} · ${esc(b.ref)}${b.source && b.source !== 'website' ? ` · via ${esc(b.source)}` : ''}</div></button>`).join('')}</div>` : '<p class="muted">No bookings.</p>'}
+      <div class="actbox">
+        ${u.suspended ? `<p style="margin:0">They can't sign in, request bookings or reset their password while suspended. Approved and confirmed bookings stay as they are.</p>
+            <p class="form-err" role="alert"></p><div><button class="btn btn-primary" type="button" id="unsuspend">Restore account</button></div>`
+          : `<h3 style="font:600 15px var(--sans);margin:0">Suspend account</h3>
+            <p class="hint" style="margin:0">They're signed out at once and can't sign in, request bookings or reset their password. Approved and confirmed bookings stay as they are, so cancel those separately if needed.</p>
+            <label class="fld"><span>Reason (only staff see this)</span><textarea id="susReason" maxlength="600" placeholder="e.g. repeated fake requests"></textarea></label>
+            ${pending ? `<label style="display:flex;gap:8px;align-items:center;font-size:14px"><input type="checkbox" id="susCancel" checked> Also cancel their ${pending} pending request${pending === 1 ? '' : 's'}</label>` : ''}
+            <p class="form-err" role="alert"></p><div><button class="btn btn-danger" type="button" id="suspend">Suspend account</button></div>`}
+      </div>`;
+    d.querySelector('.modal-x').addEventListener('click', closeDrawer);
+    d.querySelectorAll('[data-bid]').forEach((el) => el.addEventListener('click', () => openBooking(+el.dataset.bid, () => { if (onChange) onChange(); })));
+    const err = d.querySelector('.form-err');
+    const sus = d.querySelector('#suspend');
+    if (sus) sus.addEventListener('click', () => {
+      err.textContent = '';
+      const reason = d.querySelector('#susReason').value.trim();
+      if (!reason) { err.textContent = 'Write a short reason. Only staff see it.'; return; }
+      if (!sus.dataset.sure) { sus.dataset.sure = '1'; sus.textContent = 'Click again to suspend'; return; }
+      const cancelPending = !!(d.querySelector('#susCancel') && d.querySelector('#susCancel').checked);
+      A.busy(sus, 'Suspending…', () => A.api('POST', `/api/admin/users/${u.id}/suspend`, { reason, cancelPending }))
+        .then((r) => { A.toast(`${u.name || u.email} suspended${r.cancelled ? `, ${r.cancelled} pending request${r.cancelled === 1 ? '' : 's'} cancelled` : ''}.`); refreshCounts(); openCustomer(u.id, onChange); if (onChange) onChange(); })
+        .catch((e) => { err.textContent = e.message; });
+    });
+    const un = d.querySelector('#unsuspend');
+    if (un) un.addEventListener('click', () => A.busy(un, 'Restoring…', () => A.api('POST', `/api/admin/users/${u.id}/unsuspend`, {}))
+      .then(() => { A.toast('Account restored. They can sign in again.'); openCustomer(u.id, onChange); if (onChange) onChange(); })
+      .catch((e) => { err.textContent = e.message; }));
+  }
 
   // ---------- new booking (requests by phone, WhatsApp, Instagram, walk-in…) ----------
 
@@ -681,6 +789,7 @@
           ${f('open_hour', 'Opens at (0–23)', 'number', 'min="0" max="23"')}${f('close_hour', 'Closes at (1–24)', 'number', 'min="1" max="24"')}
           ${f('min_hours', 'Minimum hours per booking', 'number', 'min="1" max="24"')}${f('max_guests', 'Maximum guests', 'number', 'min="1"')}
           ${f('pay_within_hours', 'Hours to pay after approval (0 = no limit)', 'number', 'min="0"')}
+          ${f('gap_hours', 'Gap between bookings, in hours, for set-up and cleaning (0 = back-to-back allowed)', 'number', 'min="0" max="12"')}
           ${f('admin_idle_minutes', 'Sign staff out after this many minutes without activity', 'number', 'min="5" max="480"')}
         </div></div>
         <div class="panel"><h2>Bank transfer details</h2><div class="grid2">
@@ -713,7 +822,7 @@
     const m = main();
     m.innerHTML = '<h1>Activity log</h1><p class="sub">The last 200 admin actions, including failed sign-ins.</p><div id="log"><p class="muted">Loading…</p></div>';
     const { entries } = await A.api('GET', '/api/admin/audit');
-    const labels = { login: 'Signed in', login_failed: 'Failed sign-in', approve: 'Approved', reject: 'Rejected', confirm: 'Confirmed payment', 'reject-slip': 'Rejected slip', cancel: 'Cancelled', block: 'Blocked time', settings: 'Changed settings', admin_added: 'Added admin', admin_disabled: 'Disabled admin', admin_updated: 'Updated admin', admin_password_reset: 'Reset admin password', admin_removed: 'Removed admin', master_transferred: 'Handed over master', password_changed: 'Changed own password', setup: 'Setup', resend_email: 'Resent email', test_email: 'Sent test email', manual_booking: 'Added a booking', slip_added: 'Attached a slip', reschedule: 'Changed the time' };
+    const labels = { login: 'Signed in', login_failed: 'Failed sign-in', approve: 'Approved', reject: 'Rejected', confirm: 'Confirmed payment', 'reject-slip': 'Rejected slip', cancel: 'Cancelled', block: 'Blocked time', settings: 'Changed settings', admin_added: 'Added admin', admin_disabled: 'Disabled admin', admin_updated: 'Updated admin', admin_password_reset: 'Reset admin password', admin_removed: 'Removed admin', master_transferred: 'Handed over master', password_changed: 'Changed own password', setup: 'Setup', resend_email: 'Resent email', test_email: 'Sent test email', manual_booking: 'Added a booking', slip_added: 'Attached a slip', reschedule: 'Changed the time', user_suspended: 'Suspended a customer', user_unsuspended: 'Restored a customer' };
     document.getElementById('log').innerHTML = entries.length ? `<table class="table" style="display:table"><thead><tr><th>When</th><th>Who</th><th>What</th><th>Details</th><th>IP</th></tr></thead><tbody>
       ${entries.map((e) => `<tr style="cursor:default"><td class="muted">${esc(A.fmtWhen(e.at))}</td><td>${esc(e.username || '–')}</td><td>${esc(labels[e.action] || e.action)}</td><td>${esc(e.detail)}</td><td class="muted">${esc(e.ip)}</td></tr>`).join('')}
       </tbody></table>` : '<div class="panel">No activity yet.</div>';

@@ -22,7 +22,16 @@ export function publicUser(u) {
 export async function currentUser(env, request) {
   const id = await readSession(env, request, 'user');
   if (!id) return null;
-  return env.DB.prepare('SELECT * FROM users WHERE id = ?').bind(id).first();
+  const u = await env.DB.prepare('SELECT * FROM users WHERE id = ?').bind(id).first();
+  return u && !u.suspended ? u : null; // a suspended account is treated as signed out everywhere
+}
+
+export const SUSPENDED_MSG = 'This account is suspended. Contact the venue if you think this is a mistake.';
+
+// Records the sign-in time. Ignored if the database hasn't had migration 0003 yet.
+async function touchLogin(env, id) {
+  try { await env.DB.prepare('UPDATE users SET last_login_at = ? WHERE id = ?').bind(now(), id).run(); }
+  catch (e) { if (!/no such column|has no column named/i.test(String(e && e.message))) throw e; }
 }
 
 export async function requireUser(env, request) {
@@ -77,7 +86,8 @@ export async function handleAuth(request, env, ctx, url, path) {
     if (name.length < 2) throw bad('Enter your name.');
     if (!validPrehash(body.pw)) throw bad('Password could not be processed. Reload the page and try again.');
     await hit(env, `signup:ip:${ip}`, 10);
-    const exists = await env.DB.prepare('SELECT id, email, password_hash, google_sub, apple_sub FROM users WHERE email = ?').bind(email).first();
+    const exists = await env.DB.prepare('SELECT * FROM users WHERE email = ?').bind(email).first();
+    if (exists && exists.suspended) throw new HttpError(403, SUSPENDED_MSG, 'suspended');
     if (exists && !exists.password_hash && !exists.google_sub && !exists.apple_sub) {
       // The venue booked for this email by phone/WhatsApp. Prove it's theirs by email before setting a password.
       await hit(env, `forgot:acct:${email}`, 3);
@@ -89,6 +99,7 @@ export async function handleAuth(request, env, ctx, url, path) {
     const hash = await hashPassword(env, body.pw);
     const r = await env.DB.prepare('INSERT INTO users (email, name, phone, password_hash, email_verified, created_at) VALUES (?,?,?,?,0,?) RETURNING *')
       .bind(email, name, phone, hash, now()).first();
+    await touchLogin(env, r.id);
     await sendVerification(env, ctx, r);
     const set = await createSession(env, 'user', r.id, ip);
     return json({ user: publicUser(r) }, 201, { 'set-cookie': set });
@@ -113,6 +124,8 @@ export async function handleAuth(request, env, ctx, url, path) {
       throw unauthorized('Email or password is incorrect.');
     }
     await clearHits(env, `login:acct:${email}`);
+    if (u.suspended) throw new HttpError(403, SUSPENDED_MSG, 'suspended');
+    await touchLogin(env, u.id);
     if (needsRehash) await env.DB.prepare('UPDATE users SET password_hash = ? WHERE id = ?').bind(await hashPassword(env, body.pw), u.id).run();
     const set = await createSession(env, 'user', u.id, ip);
     return json({ user: publicUser(u) }, 200, { 'set-cookie': set });
@@ -154,8 +167,8 @@ export async function handleAuth(request, env, ctx, url, path) {
     if (!EMAIL_RE.test(email)) throw bad('Enter a valid email address.');
     await hit(env, `forgot:ip:${ip}`, 6);
     await hit(env, `forgot:acct:${email}`, 3);
-    const u = await env.DB.prepare('SELECT id, email FROM users WHERE email = ?').bind(email).first();
-    if (u) {
+    const u = await env.DB.prepare('SELECT * FROM users WHERE email = ?').bind(email).first();
+    if (u && !u.suspended) {
       const token = await issueToken(env, 'reset', u.id, 3600 * 1000);
       ctx.waitUntil(mail.reset(env, u.email, `${env.APP_URL}/account?reset=${token}`));
     }
@@ -175,6 +188,8 @@ export async function handleAuth(request, env, ctx, url, path) {
     if (!validPrehash(body.pw)) throw bad('Password could not be processed.');
     const userId = await useToken(env, 'reset', body.token);
     if (!userId) throw bad('This reset link has expired. Ask for a new one.', 'expired');
+    const target = await env.DB.prepare('SELECT * FROM users WHERE id = ?').bind(userId).first();
+    if (target && target.suspended) throw new HttpError(403, SUSPENDED_MSG, 'suspended');
     // Clicking the emailed link also proves the address belongs to them.
     await env.DB.prepare('UPDATE users SET password_hash = ?, email_verified = 1 WHERE id = ?').bind(await hashPassword(env, body.pw), userId).run();
     await destroyAllSessions(env, 'user', userId);
@@ -216,6 +231,8 @@ export async function handleAuth(request, env, ctx, url, path) {
     const issOk = c.iss === 'https://accounts.google.com' || c.iss === 'accounts.google.com';
     if (!issOk || c.aud !== env.GOOGLE_CLIENT_ID || c.exp * 1000 < now() || c.nonce !== saved.nonce || !c.email || !c.email_verified) return oauthFail('google');
     const user = await upsertOAuthUser(env, 'google_sub', c.sub, cleanEmail(c.email), cleanName(c.name));
+    if (user.suspended) return redirect('/account?oauth=suspended', { 'set-cookie': clearCookie('__Host-aveela_o', 'Lax') });
+    await touchLogin(env, user.id);
     const set = await createSession(env, 'user', user.id, ip);
     const h = new Headers({ location: saved.next, 'cache-control': 'no-store' });
     h.append('set-cookie', set);
@@ -258,6 +275,8 @@ export async function handleAuth(request, env, ctx, url, path) {
     const verified = c.email_verified === true || c.email_verified === 'true';
     if (!verified) return oauthFail('apple');
     const user = await upsertOAuthUser(env, 'apple_sub', c.sub, cleanEmail(c.email), name);
+    if (user.suspended) return new Response(null, { status: 303, headers: { location: '/account?oauth=suspended', 'set-cookie': clearCookie('__Host-aveela_o', 'None') } });
+    await touchLogin(env, user.id);
     const set = await createSession(env, 'user', user.id, ip);
     const h = new Headers({ location: saved.next, 'cache-control': 'no-store' });
     h.append('set-cookie', set);

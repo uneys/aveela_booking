@@ -9,9 +9,9 @@ export const now = () => Date.now();
 export const SETTING_DEFAULTS = {
   hourly_rate: '2500', currency: 'MVR', open_hour: '8', close_hour: '24', min_hours: '2',
   max_guests: '250', pay_within_hours: '48', bank_name: '', account_name: '', account_number: '',
-  payment_note: 'Please use your booking reference as the transfer remark.', notify_email: '', admin_idle_minutes: '30',
+  payment_note: 'Please use your booking reference as the transfer remark.', notify_email: '', admin_idle_minutes: '30', gap_hours: '0',
 };
-export const NUMERIC_SETTINGS = ['hourly_rate', 'open_hour', 'close_hour', 'min_hours', 'max_guests', 'pay_within_hours', 'admin_idle_minutes'];
+export const NUMERIC_SETTINGS = ['hourly_rate', 'open_hour', 'close_hour', 'min_hours', 'max_guests', 'pay_within_hours', 'admin_idle_minutes', 'gap_hours'];
 
 export async function getSettings(env) {
   const { results } = await env.DB.prepare('SELECT key, value FROM settings').all();
@@ -179,13 +179,29 @@ export async function expireUnpaid(env) {
     .bind(now(), now()).run();
 }
 
+// Hours kept free between bookings for set-up and cleaning (Settings → "Gap between bookings").
+export async function gapHours(env) {
+  const row = await env.DB.prepare("SELECT value FROM settings WHERE key = 'gap_hours'").first();
+  const g = parseInt(row ? row.value : '0', 10);
+  return Number.isFinite(g) && g > 0 ? Math.min(g, 12) : 0;
+}
+
+// Bookings on the same date whose hours (plus the gap) overlap [start, end).
 export async function findClashes(env, date, start, end, excludeId = 0, statuses = HOLDING) {
+  const g = await gapHours(env);
   const q = `SELECT id, ref, status, start_hour, end_hour FROM bookings
              WHERE date = ? AND id != ? AND start_hour < ? AND end_hour > ?
              AND status IN (${statuses.map(() => '?').join(',')})`;
-  const { results } = await env.DB.prepare(q).bind(date, excludeId, end, start, ...statuses).all();
+  const { results } = await env.DB.prepare(q).bind(date, excludeId, end + g, start - g, ...statuses).all();
   return results;
 }
+
+// SQL condition that makes a write fail if the hours were taken a moment earlier (two staff approving
+// at once). The check and the write happen in one statement, so they can't interleave.
+// Bind with: ...guardArgs(excludeId, date, start, end, gap)
+export const FREE_GUARD = `NOT EXISTS (SELECT 1 FROM bookings o WHERE o.id != ? AND o.date = ? AND o.start_hour < ? AND o.end_hour > ?
+  AND o.status IN ('approved','slip_uploaded','confirmed','blocked'))`;
+export const guardArgs = (excludeId, date, start, end, g) => [excludeId, date, end + g, start - g];
 
 export function newRef() {
   const alphabet = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';

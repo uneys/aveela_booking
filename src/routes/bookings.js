@@ -1,6 +1,6 @@
 // Public availability, customer booking requests, bank slip upload.
 import { json, readJson, bad, forbidden, notFound, conflict, clientIp, HttpError } from '../lib/http.js';
-import { now, getSettings, venueToday, venueHourNow, isDate, HOLDING, expireUnpaid, findClashes, newRef, hit, describeSlot } from '../lib/core.js';
+import { now, getSettings, venueToday, venueHourNow, isDate, HOLDING, expireUnpaid, findClashes, newRef, hit, describeSlot, gapHours } from '../lib/core.js';
 import { requireUser, googleEnabled, appleEnabled } from './auth.js';
 import { mail, statusEmail } from '../lib/email.js';
 
@@ -87,7 +87,7 @@ export async function handleBookings(request, env, ctx, url, path) {
     return json({
       googleEnabled: googleEnabled(env), appleEnabled: appleEnabled(env), openHour: s.open_hour, closeHour: s.close_hour,
       minHours: s.min_hours, maxGuests: s.max_guests, hourlyRate: s.hourly_rate, currency: s.currency, today: venueToday(env),
-      nowHour: venueHourNow(env), eventTypes: EVENT_TYPES, sources: SOURCES, monthsAhead: MONTHS_AHEAD,
+      nowHour: venueHourNow(env), eventTypes: EVENT_TYPES, sources: SOURCES, monthsAhead: MONTHS_AHEAD, gapHours: s.gap_hours,
     });
   }
 
@@ -100,9 +100,12 @@ export async function handleBookings(request, env, ctx, url, path) {
       `SELECT date, start_hour, end_hour, status FROM bookings WHERE date LIKE ? AND status IN ('pending','approved','slip_uploaded','confirmed','blocked') ORDER BY date, start_hour`
     ).bind(`${month}-%`).all();
     const days = {};
+    const g = await gapHours(env);
     for (const r of results) {
       const d = (days[r.date] ||= { booked: [], requested: [] });
-      (HOLDING.includes(r.status) ? d.booked : d.requested).push([r.start_hour, r.end_hour]);
+      // Held bookings also block the set-up/cleaning gap on either side.
+      if (HOLDING.includes(r.status)) d.booked.push([Math.max(0, r.start_hour - g), Math.min(24, r.end_hour + g)]);
+      else d.requested.push([r.start_hour, r.end_hour]);
     }
     return new Response(JSON.stringify({ month, days }), { headers: { 'content-type': 'application/json', 'cache-control': 'no-store' } });
   }
