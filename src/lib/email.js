@@ -124,19 +124,39 @@ export const mail = {
       text: `Thanks! We'll check the date and reply soon.\n\n${bookingText(s, b)}\n\n${env.APP_URL}/account`,
     });
   },
-  approved(env, s, to, b) {
+  approved(env, s, to, b, changedFrom) {
     const bank = [s.bank_name && `Bank: ${s.bank_name}`, s.account_name && `Account name: ${s.account_name}`, s.account_number && `Account number: ${s.account_number}`].filter(Boolean);
     const deadline = b.pay_by ? new Date(b.pay_by).toLocaleString('en-GB', { timeZone: env.VENUE_TZ || 'Indian/Maldives', dateStyle: 'full', timeStyle: 'short' }) : '';
     return sendEmail(env, {
       to, subject: `Approved: ${b.ref}. Please complete payment`,
       html: layout(env, 'Your booking is approved',
         p(`Great news, your date is approved. To lock it in, transfer <strong>${esc(money(s, b.amount))}</strong> and upload the bank slip${deadline ? ` by <strong>${esc(deadline)}</strong>` : ''}.`) +
+        (changedFrom ? p(`Please note: we adjusted your booking from <strong>${esc(changedFrom)}</strong> to the date and time below.`) : '') +
         bookingTable(s, b) +
         (bank.length ? `<p style="font-size:15px;line-height:1.7;margin:0 0 14px;background:#f8f6f2;padding:14px 16px;border-radius:10px">${bank.map(esc).join('<br>')}</p>` : '') +
         (s.payment_note ? p(esc(s.payment_note)) : '') +
         (b.vendor_note ? p(`Note from us: ${esc(b.vendor_note)}`) : '') +
         button(`${env.APP_URL}/account`, 'Upload bank slip')),
-      text: `Your booking is approved. Transfer ${money(s, b.amount)} and upload the bank slip${deadline ? ` by ${deadline}` : ''}.\n\n${bookingText(s, b)}\n\n${bank.join('\n')}\n${s.payment_note || ''}\n${b.vendor_note ? 'Note from us: ' + b.vendor_note : ''}\n\nUpload the slip: ${env.APP_URL}/account`,
+      text: `Your booking is approved. Transfer ${money(s, b.amount)} and upload the bank slip${deadline ? ` by ${deadline}` : ''}.${changedFrom ? `\nPlease note: we adjusted your booking from ${changedFrom} to the date and time below.` : ''}\n\n${bookingText(s, b)}\n\n${bank.join('\n')}\n${s.payment_note || ''}\n${b.vendor_note ? 'Note from us: ' + b.vendor_note : ''}\n\nUpload the slip: ${env.APP_URL}/account`,
+    });
+  },
+  // The venue changed the date/time of a request that's still waiting for approval.
+  timeChanged(env, s, to, b, changedFrom) {
+    return sendEmail(env, {
+      to, subject: `New time suggested for your request ${b.ref}`,
+      html: layout(env, 'We suggested a different time',
+        p(`We changed your request from <strong>${esc(changedFrom)}</strong> to the time below. It's still waiting for approval.`) +
+        bookingTable(s, b) + (b.vendor_note ? p(`Note from us: ${esc(b.vendor_note)}`) : '') +
+        p("If this doesn't work for you, reply to this email, or change or cancel the request on your bookings page.") +
+        button(`${env.APP_URL}/account`, 'View my bookings')),
+      text: `We changed your request from ${changedFrom} to the time below. It's still waiting for approval.\n\n${bookingText(s, b)}\n\nIf this doesn't work, reply to this email, or change or cancel it at ${env.APP_URL}/account`,
+    });
+  },
+  vendorChanged(env, s, b, customer, changedFrom) {
+    return sendEmail(env, {
+      to: s.notify_email, subject: `Request ${b.ref} changed to ${fmtDate(b.date)}`, replyTo: customer.email,
+      html: layout(env, 'A customer changed their request', p(`${esc(customer.name)} changed their request from ${esc(changedFrom)} to:`) + bookingTable(s, b) + button(`${env.APP_URL}/admin`, 'Open admin panel')),
+      text: `${customer.name} changed their request from ${changedFrom} to:\n${bookingText(s, b)}\n\n${env.APP_URL}/admin`,
     });
   },
   rejected(env, s, to, b) {

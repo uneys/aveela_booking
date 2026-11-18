@@ -163,6 +163,10 @@ export function fmtDate(d) {
   return new Date(d + 'T12:00:00Z').toLocaleDateString('en-GB', { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric', timeZone: 'UTC' });
 }
 
+export function describeSlot(b) {
+  return `${fmtDate(b.date)}, ${fmtHour(b.start_hour)} to ${fmtHour(b.end_hour)}`;
+}
+
 export function money(settings, amount) {
   return `${settings.currency} ${Number(amount).toLocaleString('en-US')}`;
 }

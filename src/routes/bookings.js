@@ -1,6 +1,6 @@
 // Public availability, customer booking requests, bank slip upload.
 import { json, readJson, bad, forbidden, notFound, conflict, clientIp, HttpError } from '../lib/http.js';
-import { now, getSettings, venueToday, venueHourNow, isDate, HOLDING, expireUnpaid, findClashes, newRef, hit } from '../lib/core.js';
+import { now, getSettings, venueToday, venueHourNow, isDate, HOLDING, expireUnpaid, findClashes, newRef, hit, describeSlot } from '../lib/core.js';
 import { requireUser, googleEnabled, appleEnabled } from './auth.js';
 import { mail, statusEmail } from '../lib/email.js';
 
@@ -146,11 +146,31 @@ export async function handleBookings(request, env, ctx, url, path) {
     return json({ booking: publicBooking(b) }, 201);
   }
 
-  const m = path.match(/^\/api\/bookings\/(\d+)\/(cancel|slip|resend-email)$/);
+  const m = path.match(/^\/api\/bookings\/(\d+)\/(cancel|slip|resend-email|change)$/);
   if (m) {
     const u = await requireUser(env, request);
     const b = await env.DB.prepare('SELECT * FROM bookings WHERE id = ? AND user_id = ?').bind(Number(m[1]), u.id).first();
     if (!b) throw notFound('Booking not found.');
+
+    // Customers can change the date, hours or guests while the request is still waiting.
+    if (m[2] === 'change' && method === 'POST') {
+      if (b.status !== 'pending') throw conflict('This request was already answered, so it can no longer be changed online. Contact us instead.');
+      const body = await readJson(request);
+      const s = await getSettings(env);
+      const slot = validateSlot(s, env, { date: body.date, start: body.start, end: body.end });
+      const guests = Number(body.guests ?? b.guests);
+      if (!Number.isInteger(guests) || guests < 1 || guests > s.max_guests) throw bad(`Guests must be between 1 and ${s.max_guests}.`);
+      if (slot.date === b.date && slot.start === b.start_hour && slot.end === b.end_hour && guests === b.guests) throw bad('Nothing changed.');
+      await hit(env, `change:${u.id}`, 10);
+      await expireUnpaid(env);
+      if ((await findClashes(env, slot.date, slot.start, slot.end, b.id)).length) throw conflict('Those hours are already booked. Pick another time.', 'taken');
+      const from = describeSlot(b);
+      const r = await env.DB.prepare("UPDATE bookings SET date = ?, start_hour = ?, end_hour = ?, guests = ?, amount = ?, updated_at = ? WHERE id = ? AND status = 'pending' RETURNING *")
+        .bind(slot.date, slot.start, slot.end, guests, (slot.end - slot.start) * s.hourly_rate, now(), b.id).first();
+      if (!r) throw conflict('This request changed in the meantime. Reload and try again.');
+      ctx.waitUntil(mail.vendorChanged(env, s, r, u, from));
+      return json({ booking: publicBooking(r) });
+    }
 
     if (m[2] === 'cancel' && method === 'POST') {
       if (!['pending', 'approved'].includes(b.status)) throw conflict('This booking can no longer be cancelled online. Contact us.');

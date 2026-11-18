@@ -3,7 +3,7 @@ import { json, readJson, bad, unauthorized, forbidden, notFound, conflict, clien
 import { hashPassword, verifyPassword, dummyVerify, validPrehash, timingSafeEqual } from '../lib/crypto.js';
 import {
   now, getSettings, SETTING_DEFAULTS, NUMERIC_SETTINGS, createSession, readSession, destroySession, destroyAllSessions,
-  hit, peek, clearHits, audit, expireUnpaid, findClashes, newRef, isDate, sessionEndReason, venueToday,
+  hit, peek, clearHits, audit, expireUnpaid, findClashes, newRef, isDate, sessionEndReason, venueToday, describeSlot,
 } from '../lib/core.js';
 import { publicBooking, serveSlip, readSlipUpload, storeSlip, EVENT_TYPES, SOURCES } from './bookings.js';
 import { mail, statusEmail, emailProvider } from '../lib/email.js';
@@ -67,6 +67,21 @@ async function loadBooking(env, id) {
   const b = await env.DB.prepare(`${BOOKING_SELECT} WHERE b.id = ?`).bind(id).first();
   if (!b) throw notFound('Booking not found.');
   return b;
+}
+
+// Reads an optional new date/time/guests from a request body. Returns null when nothing changed.
+function slotChange(env, b, body) {
+  const has = ['date', 'start', 'end', 'guests'].some((k) => body[k] !== undefined && body[k] !== '');
+  if (!has) return null;
+  const date = body.date ?? b.date, start = Number(body.start ?? b.start_hour), end = Number(body.end ?? b.end_hour);
+  const guests = Number(body.guests ?? b.guests);
+  if (!isDate(date)) throw bad('Pick a valid date.');
+  if (date < venueToday(env)) throw bad('That date has passed.');
+  if (!Number.isInteger(start) || !Number.isInteger(end) || start < 0 || end > 24 || end <= start) throw bad('Pick a start and end time, ending after it starts.');
+  if (!Number.isInteger(guests) || guests < 1 || guests > 10000) throw bad('Enter the number of guests.');
+  const timeChanged = date !== b.date || start !== b.start_hour || end !== b.end_hour;
+  if (!timeChanged && guests === b.guests) return null;
+  return { date, start, end, guests, timeChanged, from: describeSlot(b) };
 }
 
 const noteOf = (body) => String(body.note || '').replace(/[\u0000-\u0008\u000b-\u001f]/g, '').trim().slice(0, 600);
@@ -256,7 +271,7 @@ export async function handleAdmin(request, env, ctx, url, path) {
     return json({ booking: publicBooking(b) }, 201);
   }
 
-  const bm = path.match(/^\/api\/admin\/bookings\/(\d+)(?:\/(approve|reject|confirm|reject-slip|cancel|slip|resend-email))?$/);
+  const bm = path.match(/^\/api\/admin\/bookings\/(\d+)(?:\/(approve|reject|confirm|reject-slip|cancel|slip|resend-email|reschedule))?$/);
   if (bm) {
     const a = await requireAdmin(env, request);
     const id = Number(bm[1]);
@@ -297,17 +312,39 @@ export async function handleAdmin(request, env, ctx, url, path) {
     const email = customerEmail(b);
     let updated;
 
-    if (action === 'approve') {
+    if (action === 'reschedule') {
+      // Change the date, hours or guests of a request before deciding on it.
+      if (b.status !== 'pending') throw conflict('You can change the time only while the request is waiting for approval.');
+      const ch = slotChange(env, b, body);
+      if (!ch) throw bad('Nothing changed.');
+      const amount = body.amount === undefined || body.amount === '' ? (ch.end - ch.start) * s.hourly_rate : Number(body.amount);
+      if (!Number.isInteger(amount) || amount < 0 || amount > 100000000) throw bad('Enter the amount as a whole number.');
+      updated = await env.DB.prepare("UPDATE bookings SET date = ?, start_hour = ?, end_hour = ?, guests = ?, amount = ?, vendor_note = CASE WHEN ? = '' THEN vendor_note ELSE ? END, updated_at = ? WHERE id = ? AND status = 'pending' RETURNING *")
+        .bind(ch.date, ch.start, ch.end, ch.guests, amount, note, note, t, id).first();
+      if (!updated) throw conflict('This booking changed in the meantime. Reload and try again.');
+      let emailed = null;
+      if (email && body.notify && ch.timeChanged) {
+        const r = await mail.timeChanged(env, s, email, updated, ch.from);
+        emailed = r.ok ? 'sent' : (r.error || 'failed');
+      }
+      await audit(env, a.id, 'reschedule', `${b.ref}: ${ch.from} → ${describeSlot(updated)}, ${ch.guests} guests`, ip);
+      const clashes = await findClashes(env, updated.date, updated.start_hour, updated.end_hour, id);
+      return json({ booking: adminBooking(await loadBooking(env, id)), emailed, clashes });
+    } else if (action === 'approve') {
       if (b.status !== 'pending') throw conflict('Only pending requests can be approved.');
-      const clashes = await findClashes(env, b.date, b.start_hour, b.end_hour, b.id);
-      if (clashes.length) throw conflict(`Those hours are already taken by ${clashes.map((c) => c.ref).join(', ')}. Reject this request or cancel the other booking first.`);
-      const amount = body.amount === undefined || body.amount === '' ? b.amount : Number(body.amount);
+      // The approve form can carry a changed date/time, applied in the same step.
+      const ch = slotChange(env, b, body);
+      const date = ch ? ch.date : b.date, start = ch ? ch.start : b.start_hour, end = ch ? ch.end : b.end_hour, guests = ch ? ch.guests : b.guests;
+      const clashes = await findClashes(env, date, start, end, b.id);
+      if (clashes.length) throw conflict(`Those hours are already taken by ${clashes.map((c) => c.ref).join(', ')}. Pick other hours, reject this request or cancel the other booking first.`);
+      const amount = body.amount === undefined || body.amount === '' ? (ch ? (end - start) * s.hourly_rate : b.amount) : Number(body.amount);
       if (!Number.isInteger(amount) || amount < 0 || amount > 100000000) throw bad('Enter the amount as a whole number.');
       const payBy = s.pay_within_hours > 0 ? t + s.pay_within_hours * 3600 * 1000 : null;
-      updated = await env.DB.prepare("UPDATE bookings SET status = 'approved', amount = ?, vendor_note = ?, pay_by = ?, decided_by = ?, updated_at = ? WHERE id = ? AND status = 'pending' RETURNING *")
-        .bind(amount, note, payBy, a.id, t, id).first();
+      updated = await env.DB.prepare("UPDATE bookings SET status = 'approved', date = ?, start_hour = ?, end_hour = ?, guests = ?, amount = ?, vendor_note = ?, pay_by = ?, decided_by = ?, updated_at = ? WHERE id = ? AND status = 'pending' RETURNING *")
+        .bind(date, start, end, guests, amount, note, payBy, a.id, t, id).first();
       if (!updated) throw conflict('This booking changed in the meantime. Reload and try again.');
-      if (email) ctx.waitUntil(mail.approved(env, s, email, updated));
+      if (ch) await audit(env, a.id, 'reschedule', `${b.ref}: ${ch.from} → ${describeSlot(updated)}, ${guests} guests`, ip);
+      if (email) ctx.waitUntil(mail.approved(env, s, email, updated, ch && ch.timeChanged ? ch.from : null));
     } else if (action === 'reject') {
       if (b.status !== 'pending') throw conflict('Only pending requests can be rejected.');
       updated = await env.DB.prepare("UPDATE bookings SET status = 'rejected', vendor_note = ?, decided_by = ?, updated_at = ? WHERE id = ? AND status = 'pending' RETURNING *")
