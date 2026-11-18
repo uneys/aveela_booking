@@ -3,9 +3,9 @@ import { json, readJson, bad, unauthorized, forbidden, notFound, conflict, clien
 import { hashPassword, verifyPassword, dummyVerify, validPrehash, timingSafeEqual } from '../lib/crypto.js';
 import {
   now, getSettings, SETTING_DEFAULTS, NUMERIC_SETTINGS, createSession, readSession, destroySession, destroyAllSessions,
-  hit, peek, clearHits, audit, expireUnpaid, findClashes, newRef, isDate,
+  hit, peek, clearHits, audit, expireUnpaid, findClashes, newRef, isDate, sessionEndReason, venueToday,
 } from '../lib/core.js';
-import { publicBooking, serveSlip } from './bookings.js';
+import { publicBooking, serveSlip, readSlipUpload, storeSlip, EVENT_TYPES, SOURCES } from './bookings.js';
 import { mail, statusEmail, emailProvider } from '../lib/email.js';
 
 const USERNAME_RE = /^[a-z0-9._-]{3,32}$/;
@@ -25,7 +25,13 @@ async function currentAdmin(env, request) {
 
 async function requireAdmin(env, request, { allowMustChange = false } = {}) {
   const a = await currentAdmin(env, request);
-  if (!a) throw unauthorized('Your admin session has ended. Sign in again.');
+  if (!a) {
+    if (sessionEndReason(request) === 'idle') {
+      const s = await getSettings(env);
+      throw new HttpError(401, `You were signed out after ${s.admin_idle_minutes} minutes without activity. Sign in again.`, 'idle_timeout');
+    }
+    throw unauthorized('Your admin session has ended. Sign in again.');
+  }
   if (a.must_change && !allowMustChange) throw forbidden('Set a new password before continuing.');
   return a;
 }
@@ -36,12 +42,26 @@ async function requireMaster(env, request) {
   return a;
 }
 
+// Website bookings use the customer's account; manual bookings may only have the details typed in.
 function adminBooking(b) {
-  return { ...publicBooking(b), customer: b.user_id ? { id: b.user_id, name: b.u_name, email: b.u_email, phone: b.u_phone } : null, decidedBy: b.a_name || null };
+  let customer = null;
+  if (b.status !== 'blocked' && (b.user_id || b.customer_name)) {
+    customer = {
+      id: b.user_id || null,
+      name: b.customer_name || b.u_name || '',
+      email: b.u_email || b.customer_email || '',
+      phone: b.customer_phone || b.u_phone || '',
+      hasAccount: !!(b.user_id && b.u_has_login),
+    };
+  }
+  return { ...publicBooking(b), customer, decidedBy: b.a_name || null, createdBy: b.c_name || null };
 }
+const customerEmail = (b) => b.u_email || b.customer_email || '';
 
-const BOOKING_SELECT = `SELECT b.*, u.name AS u_name, u.email AS u_email, u.phone AS u_phone, a.name AS a_name
-  FROM bookings b LEFT JOIN users u ON u.id = b.user_id LEFT JOIN admins a ON a.id = b.decided_by`;
+const BOOKING_SELECT = `SELECT b.*, u.name AS u_name, u.email AS u_email, u.phone AS u_phone,
+  (u.password_hash IS NOT NULL OR u.google_sub IS NOT NULL OR u.apple_sub IS NOT NULL) AS u_has_login,
+  a.name AS a_name, c.name AS c_name
+  FROM bookings b LEFT JOIN users u ON u.id = b.user_id LEFT JOIN admins a ON a.id = b.decided_by LEFT JOIN admins c ON c.id = b.created_by`;
 
 async function loadBooking(env, id) {
   const b = await env.DB.prepare(`${BOOKING_SELECT} WHERE b.id = ?`).bind(id).first();
@@ -58,7 +78,14 @@ export async function handleAdmin(request, env, ctx, url, path) {
   if (path === '/api/admin/state' && method === 'GET') {
     const count = await env.DB.prepare('SELECT COUNT(*) AS n FROM admins').first();
     const a = await currentAdmin(env, request);
-    return json({ needsSetup: count.n === 0, setupEnabled: !!env.SETUP_TOKEN, admin: a ? publicAdmin(a) : null });
+    const idle = a ? (await getSettings(env)).admin_idle_minutes : null;
+    return json({ needsSetup: count.n === 0, setupEnabled: !!env.SETUP_TOKEN, admin: a ? publicAdmin(a) : null, idleMinutes: idle });
+  }
+
+  // Keeps the session alive while someone is actually using the panel (typing a long note, etc.).
+  if (path === '/api/admin/ping' && method === 'POST') {
+    await requireAdmin(env, request, { allowMustChange: true });
+    return json({ ok: true });
   }
 
   // First run only: creates the master admin. Needs the SETUP_TOKEN secret.
@@ -151,11 +178,68 @@ export async function handleAdmin(request, env, ctx, url, path) {
     }
     if (scope === 'upcoming') { where.push("b.date >= date('now','-1 day')"); }
     if (scope === 'past') { where.push("b.date < date('now')"); }
-    if (q) { where.push('(b.ref LIKE ? OR u.email LIKE ? OR u.name LIKE ?)'); args.push(`%${q}%`, `%${q}%`, `%${q}%`); }
+    if (q) {
+      where.push('(b.ref LIKE ? OR u.email LIKE ? OR u.name LIKE ? OR b.customer_name LIKE ? OR b.customer_email LIKE ? OR b.customer_phone LIKE ?)');
+      args.push(...Array(6).fill(`%${q}%`));
+    }
     const order = scope === 'upcoming' || status === 'pending' || status === 'slip_uploaded' ? 'b.date ASC, b.start_hour ASC' : 'b.date DESC, b.start_hour DESC';
     const sql = `${BOOKING_SELECT} ${where.length ? 'WHERE ' + where.join(' AND ') : ''} ORDER BY ${order} LIMIT 200`;
     const { results } = await env.DB.prepare(sql).bind(...args).all();
     return json({ bookings: results.map(adminBooking) });
+  }
+
+  // Manual booking: a request that came in by phone, WhatsApp, Instagram, walk-in, etc.
+  if (path === '/api/admin/bookings' && method === 'POST') {
+    const a = await requireAdmin(env, request);
+    const body = await readJson(request);
+    const s = await getSettings(env);
+    const name = String(body.name || '').replace(/[\u0000-\u001f<>]/g, '').trim().slice(0, 80);
+    const email = String(body.email || '').trim().toLowerCase().slice(0, 190);
+    const phone = String(body.phone || '').replace(/[^\d+\s()-]/g, '').trim().slice(0, 24);
+    const source = SOURCES.includes(body.source) ? body.source : null;
+    const eventType = EVENT_TYPES.includes(body.eventType) ? body.eventType : null;
+    const date = body.date, start = Number(body.start), end = Number(body.end), guests = Number(body.guests);
+    const status = ['pending', 'approved', 'confirmed'].includes(body.status) ? body.status : null;
+    const notes = String(body.notes || '').replace(/[\u0000-\u0008\u000b-\u001f]/g, '').slice(0, 1000);
+    if (name.length < 2) throw bad("Enter the customer's name.");
+    if (email && !/^[^\s@]{1,64}@[^\s@]{1,190}\.[^\s@]{2,}$/.test(email)) throw bad('That email address looks wrong.');
+    if (!email && phone.replace(/\D/g, '').length < 5) throw bad('Enter a phone number or an email, so you can reach the customer.');
+    if (!source) throw bad('Pick where the request came from.');
+    if (!eventType) throw bad('Pick an event type.');
+    if (!isDate(date)) throw bad('Pick a date.');
+    if (date < venueToday(env)) throw bad('That date has passed.');
+    if (!Number.isInteger(start) || !Number.isInteger(end) || start < 0 || end > 24 || end <= start) throw bad('Pick a start and end time, ending after it starts.');
+    if (!Number.isInteger(guests) || guests < 1 || guests > 10000) throw bad('Enter the number of guests.');
+    if (!status) throw bad('Pick a status.');
+    const amount = body.amount === undefined || body.amount === '' ? (end - start) * s.hourly_rate : Number(body.amount);
+    if (!Number.isInteger(amount) || amount < 0 || amount > 100000000) throw bad('Enter the amount as a whole number.');
+    if (status !== 'pending') {
+      const clashes = await findClashes(env, date, start, end);
+      if (clashes.length) throw conflict(`Those hours are already taken by ${clashes.map((c) => c.ref).join(', ')}.`, 'taken');
+    }
+    // With an email, link the booking to that customer's account, or start one they can claim
+    // later with "Forgot your password?" (then it shows on their My bookings page).
+    let userId = null;
+    if (email) {
+      const u = await env.DB.prepare('SELECT id FROM users WHERE email = ?').bind(email).first();
+      userId = u ? u.id : (await env.DB.prepare('INSERT INTO users (email, name, phone, email_verified, created_at) VALUES (?,?,?,0,?) RETURNING id')
+        .bind(email, name, phone, now()).first()).id;
+    }
+    const t = now();
+    const payBy = status === 'approved' && s.pay_within_hours > 0 ? t + s.pay_within_hours * 3600 * 1000 : null;
+    const b = await env.DB.prepare(`INSERT INTO bookings (ref, user_id, event_type, date, start_hour, end_hour, guests, notes, status, amount, vendor_note,
+        pay_by, decided_by, created_by, source, customer_name, customer_email, customer_phone, created_at, updated_at)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) RETURNING *`)
+      .bind(newRef(), userId, eventType, date, start, end, guests, notes, status, amount, noteOf(body), payBy,
+        status === 'pending' ? null : a.id, a.id, source, name, email, phone, t, t).first();
+    let emailed = null;
+    if (email && body.notify) {
+      const send = status === 'pending' ? mail.requested : status === 'approved' ? mail.approved : mail.confirmed;
+      const r = await send(env, s, email, b);
+      emailed = r.ok ? 'sent' : (r.error || 'failed');
+    }
+    await audit(env, a.id, 'manual_booking', `${b.ref} via ${source} for ${name}, ${date} ${start}-${end}, ${status}`, ip);
+    return json({ booking: adminBooking(await loadBooking(env, b.id)), emailed }, 201);
   }
 
   if (path === '/api/admin/blocks' && method === 'POST') {
@@ -186,12 +270,23 @@ export async function handleAdmin(request, env, ctx, url, path) {
     if (action === 'slip' && method === 'GET') return serveSlip(env, b);
     if (action === 'resend-email' && method === 'POST') {
       const which = statusEmail(b);
-      if (!which || !b.u_email) throw bad('There is no email to resend for this booking.');
+      if (!which || !customerEmail(b)) throw bad('There is no email address for this booking.');
       await hit(env, `resend:admin:${a.id}`, 20);
-      const r = await which.send(env, await getSettings(env), b.u_email, b);
+      const r = await which.send(env, await getSettings(env), customerEmail(b), b);
       await audit(env, a.id, 'resend_email', `${b.ref}: ${which.label}${r.ok ? '' : ' (failed)'}`, ip);
       if (!r.ok) throw new HttpError(502, r.error || 'The email could not be sent.', 'email_failed');
-      return json({ ok: true, sent: which.label, to: b.u_email, provider: r.provider });
+      return json({ ok: true, sent: which.label, to: customerEmail(b), provider: r.provider });
+    }
+    // Staff attach a slip themselves (paid in person, screenshot sent on WhatsApp, etc.).
+    if (action === 'slip' && method === 'POST') {
+      if (!['approved', 'slip_uploaded', 'confirmed'].includes(b.status)) throw conflict('You can add a slip once the booking is approved.');
+      const upload = await readSlipUpload(request);
+      const key = await storeSlip(env, ctx, b, upload);
+      await env.DB.prepare(`UPDATE bookings SET slip_key = ?, slip_type = ?, slip_at = ?, updated_at = ?,
+          status = CASE WHEN status = 'approved' THEN 'slip_uploaded' ELSE status END WHERE id = ?`)
+        .bind(key, upload.type, now(), now(), b.id).run();
+      await audit(env, a.id, 'slip_added', b.ref, ip);
+      return json({ booking: adminBooking(await loadBooking(env, id)) });
     }
     if (method !== 'POST' || !action) throw notFound();
 
@@ -199,7 +294,7 @@ export async function handleAdmin(request, env, ctx, url, path) {
     const note = noteOf(body);
     const s = await getSettings(env);
     const t = now();
-    const email = b.u_email;
+    const email = customerEmail(b);
     let updated;
 
     if (action === 'approve') {
@@ -220,8 +315,9 @@ export async function handleAdmin(request, env, ctx, url, path) {
       if (!updated) throw conflict('This booking changed in the meantime. Reload and try again.');
       if (email) ctx.waitUntil(mail.rejected(env, s, email, updated));
     } else if (action === 'confirm') {
-      if (b.status !== 'slip_uploaded') throw conflict('Only bookings with an uploaded slip can be confirmed.');
-      updated = await env.DB.prepare("UPDATE bookings SET status = 'confirmed', vendor_note = ?, decided_by = ?, updated_at = ? WHERE id = ? AND status = 'slip_uploaded' RETURNING *")
+      // From "slip uploaded", or straight from "approved" when the money came another way (cash, transfer seen in the bank app).
+      if (!['slip_uploaded', 'approved'].includes(b.status)) throw conflict('Only approved bookings can be confirmed.');
+      updated = await env.DB.prepare("UPDATE bookings SET status = 'confirmed', vendor_note = ?, decided_by = ?, updated_at = ? WHERE id = ? AND status IN ('slip_uploaded','approved') RETURNING *")
         .bind(note || b.vendor_note, a.id, t, id).first();
       if (!updated) throw conflict('This booking changed in the meantime. Reload and try again.');
       if (email) ctx.waitUntil(mail.confirmed(env, s, email, updated));
@@ -344,6 +440,10 @@ export async function handleAdmin(request, env, ctx, url, path) {
       } else v = v.slice(0, 400);
       stmts.push(env.DB.prepare('INSERT INTO settings (key, value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value = excluded.value').bind(k, v));
       changed.push(k);
+    }
+    if (body.admin_idle_minutes !== undefined) {
+      const m = Number(body.admin_idle_minutes);
+      if (!Number.isInteger(m) || m < 5 || m > 480) throw bad('Sign out after: between 5 and 480 minutes.');
     }
     const open = Number(body.open_hour ?? (await getSettings(env)).open_hour);
     const close = Number(body.close_hour ?? (await getSettings(env)).close_hour);

@@ -5,6 +5,8 @@ import { requireUser, googleEnabled, appleEnabled } from './auth.js';
 import { mail, statusEmail } from '../lib/email.js';
 
 export const EVENT_TYPES = ['Wedding', 'Engagement', 'Birthday', 'Baby shower', 'Party', 'Corporate', 'Workshop', 'Other'];
+// Where a booking request came from. 'website' is set automatically; the rest are for manual bookings.
+export const SOURCES = ['Phone call', 'WhatsApp', 'Viber', 'Instagram', 'Facebook', 'Email', 'Walk-in', 'Other'];
 const MAX_SLIP = 5 * 1024 * 1024;
 const MONTHS_AHEAD = 18;
 
@@ -13,6 +15,7 @@ export function publicBooking(b) {
     id: b.id, ref: b.ref, eventType: b.event_type, date: b.date, start: b.start_hour, end: b.end_hour,
     guests: b.guests, notes: b.notes, status: b.status, amount: b.amount, vendorNote: b.vendor_note,
     payBy: b.pay_by, hasSlip: !!b.slip_key, slipAt: b.slip_at, createdAt: b.created_at, updatedAt: b.updated_at,
+    source: b.source || 'website',
   };
 }
 
@@ -23,6 +26,28 @@ function sniffSlip(bytes) {
   if (b[0] === 0x52 && b[1] === 0x49 && b[2] === 0x46 && b[3] === 0x46 && b[8] === 0x57 && b[9] === 0x45 && b[10] === 0x42 && b[11] === 0x50) return 'image/webp';
   if (b[0] === 0x25 && b[1] === 0x50 && b[2] === 0x44 && b[3] === 0x46) return 'application/pdf';
   return null;
+}
+
+// Reads and checks an uploaded slip from a multipart form field named "slip".
+export async function readSlipUpload(request) {
+  const len = Number(request.headers.get('content-length') || 0);
+  if (len > MAX_SLIP + 20000) throw bad('The file is larger than 5 MB.');
+  const form = await request.formData();
+  const file = form.get('slip');
+  if (!file || typeof file === 'string') throw bad('Choose a file to upload.');
+  if (file.size > MAX_SLIP) throw bad('The file is larger than 5 MB.');
+  const bytes = new Uint8Array(await file.arrayBuffer());
+  const type = sniffSlip(bytes);
+  if (!type) throw bad('Upload a JPG, PNG, WebP or PDF.');
+  return { bytes, type };
+}
+
+// Saves a slip in KV (replacing any earlier one) and returns its key.
+export async function storeSlip(env, ctx, booking, { bytes, type }) {
+  if (booking.slip_key) ctx.waitUntil(env.SLIPS.delete(booking.slip_key));
+  const key = `slip/${booking.ref}/${now()}`;
+  await env.SLIPS.put(key, bytes, { metadata: { type, booking: booking.ref } });
+  return key;
 }
 
 export async function serveSlip(env, booking) {
@@ -62,7 +87,7 @@ export async function handleBookings(request, env, ctx, url, path) {
     return json({
       googleEnabled: googleEnabled(env), appleEnabled: appleEnabled(env), openHour: s.open_hour, closeHour: s.close_hour,
       minHours: s.min_hours, maxGuests: s.max_guests, hourlyRate: s.hourly_rate, currency: s.currency, today: venueToday(env),
-      nowHour: venueHourNow(env), eventTypes: EVENT_TYPES, monthsAhead: MONTHS_AHEAD,
+      nowHour: venueHourNow(env), eventTypes: EVENT_TYPES, sources: SOURCES, monthsAhead: MONTHS_AHEAD,
     });
   }
 
@@ -152,18 +177,9 @@ export async function handleBookings(request, env, ctx, url, path) {
         throw conflict(fresh.status === 'expired' ? 'The payment deadline passed. Contact us to rebook.' : 'This booking is not waiting for a slip.');
       }
       await hit(env, `slip:${u.id}`, 10);
-      const len = Number(request.headers.get('content-length') || 0);
-      if (len > MAX_SLIP + 20000) throw bad('The file is larger than 5 MB.');
-      const form = await request.formData();
-      const file = form.get('slip');
-      if (!file || typeof file === 'string') throw bad('Choose a file to upload.');
-      if (file.size > MAX_SLIP) throw bad('The file is larger than 5 MB.');
-      const bytes = new Uint8Array(await file.arrayBuffer());
-      const type = sniffSlip(bytes);
-      if (!type) throw bad('Upload a JPG, PNG, WebP or PDF.');
-      if (fresh.slip_key) ctx.waitUntil(env.SLIPS.delete(fresh.slip_key));
-      const key = `slip/${fresh.ref}/${now()}`;
-      await env.SLIPS.put(key, bytes, { metadata: { type, booking: fresh.ref } });
+      const upload = await readSlipUpload(request);
+      const type = upload.type;
+      const key = await storeSlip(env, ctx, fresh, upload);
       const r = await env.DB.prepare("UPDATE bookings SET status = 'slip_uploaded', slip_key = ?, slip_type = ?, slip_at = ?, updated_at = ? WHERE id = ? RETURNING *")
         .bind(key, type, now(), now(), fresh.id).first();
       const s = await getSettings(env);

@@ -5,6 +5,17 @@
   const root = document.getElementById('root');
   const MIN_ADMIN_PW = 12;
   let me = null, settings = null, counts = {}, pollTimer = null;
+  let idleMinutes = 30, lastActivity = Date.now(), lastPing = Date.now(), idleTimer = null, warn = null;
+
+  // Any 401 while signed in (session timed out, or ended on another device) returns to the sign-in screen.
+  const rawApi = A.api;
+  A.api = async (method, path, body, opts) => {
+    try { return await rawApi(method, path, body, opts); }
+    catch (e) {
+      if (e.status === 401 && me && !/\/api\/admin\/(login|setup|state|password)$|\/make-master$/.test(path)) expire(e.message);
+      throw e;
+    }
+  };
 
   const brand = '<div class="gate-brand"><svg viewBox="0 0 24 28" width="20" height="24" aria-hidden="true"><path d="M3 27V12a9 9 0 0 1 18 0v15" fill="none" stroke="currentColor" stroke-width="2"/><path d="M8 27V13a4 4 0 0 1 8 0v14" fill="#e9963a"/></svg>Aveela admin</div>';
 
@@ -60,8 +71,8 @@
     });
   }
 
-  function loginScreen() {
-    const c = gate(`<h1>Sign in</h1><p class="sub">Venue staff only.</p>
+  function loginScreen(message) {
+    const c = gate(`<h1>Sign in</h1><p class="sub">Venue staff only.</p>${message ? `<div class="warn" role="status">${esc(message)}</div>` : ''}
       <form class="form" novalidate>
         <label class="fld"><span>Username</span><input name="username" required autocomplete="username" autocapitalize="none"></label>
         <label class="fld"><span>Password</span><input name="pw" type="password" required autocomplete="current-password"></label>
@@ -99,6 +110,74 @@
     wirePasswordForm(c, () => { me.mustChange = false; A.toast('Password saved.'); start(); });
   }
 
+  // ---------- sign-out after inactivity ----------
+  // The server signs a session out after `admin_idle_minutes` without activity (Settings). Here we
+  // track real activity (mouse, keys, touch), share it across tabs, warn 2 minutes before, and ping
+  // the server every few minutes while someone is working so a long form doesn't get cut off.
+
+  const ACT_KEY = 'aveela_admin_active';
+  const sharedActivity = () => { try { return Math.max(lastActivity, Number(localStorage.getItem(ACT_KEY)) || 0); } catch { return lastActivity; } };
+
+  function markActive() {
+    const t = Date.now();
+    if (t - lastActivity < 3000 && !warn) return;
+    lastActivity = t;
+    try { localStorage.setItem(ACT_KEY, String(t)); } catch {}
+    if (warn) { warn.close(); warn = null; }
+    if (me && t - lastPing > 4 * 60 * 1000) { lastPing = t; A.api('POST', '/api/admin/ping', {}).catch(() => {}); }
+  }
+
+  function startIdle() {
+    stopIdle();
+    lastActivity = lastPing = Date.now();
+    try { localStorage.setItem(ACT_KEY, String(lastActivity)); } catch {}
+    ['mousemove', 'mousedown', 'keydown', 'touchstart', 'scroll', 'wheel'].forEach((ev) => window.addEventListener(ev, markActive, { passive: true, capture: true }));
+    document.addEventListener('visibilitychange', idleTick);
+    idleTimer = setInterval(idleTick, 1000);
+  }
+
+  function stopIdle() {
+    clearInterval(idleTimer); idleTimer = null;
+    ['mousemove', 'mousedown', 'keydown', 'touchstart', 'scroll', 'wheel'].forEach((ev) => window.removeEventListener(ev, markActive, { capture: true }));
+    document.removeEventListener('visibilitychange', idleTick);
+    if (warn) { warn.close(); warn = null; }
+  }
+
+  function idleTick() {
+    if (!me) return;
+    const limit = idleMinutes * 60 * 1000;
+    const left = limit - (Date.now() - sharedActivity());
+    if (left <= 0) {
+      A.api('POST', '/api/admin/logout').catch(() => {});
+      expire(`You were signed out after ${idleMinutes} minutes without activity.`);
+      return;
+    }
+    if (left <= 120000) {
+      const mmss = `${Math.floor(left / 60000)}:${String(Math.floor((left % 60000) / 1000)).padStart(2, '0')}`;
+      if (!warn) {
+        warn = A.modal(`<h2 class="dlg-title">Still there?</h2><p class="dlg-intro">For security, you'll be signed out in <strong data-left>${mmss}</strong> because there's been no activity.</p>
+          <div class="row2"><button class="btn btn-ghost" type="button" data-out>Sign out now</button><button class="btn btn-primary" type="button" data-stay>Stay signed in</button></div>`,
+          { label: 'Sign-out warning', onClose: () => { warn = null; } });
+        warn.el.querySelector('[data-stay]').addEventListener('click', () => { lastPing = 0; lastActivity = 0; markActive(); });
+        warn.el.querySelector('[data-out]').addEventListener('click', () => { A.api('POST', '/api/admin/logout').catch(() => {}); expire('You signed out.'); });
+      } else {
+        const el = warn.el.querySelector('[data-left]');
+        if (el) el.textContent = mmss;
+      }
+    } else if (warn) { warn.close(); warn = null; }
+  }
+
+  function expire(message) {
+    if (!me) return;
+    me = null;
+    stopIdle();
+    clearInterval(pollTimer);
+    closeDrawer();
+    document.querySelectorAll('.modal').forEach((m) => m.remove());
+    document.body.style.overflow = '';
+    loginScreen(message);
+  }
+
   // ---------- shell ----------
 
   const VIEWS = [
@@ -106,6 +185,7 @@
     { id: 'payments', label: 'Payments to check', count: 'slip_uploaded' },
     { id: 'upcoming', label: 'Upcoming' },
     { id: 'all', label: 'All bookings' },
+    { id: 'new', label: 'New booking' },
     { id: 'block', label: 'Block time' },
     { sep: true, master: true },
     { id: 'admins', label: 'Admin users', master: true },
@@ -130,7 +210,7 @@
       <div class="drawer-shade" id="shade"></div><aside class="drawer" id="drawer" aria-label="Booking details"></aside>`;
     document.getElementById('logout').addEventListener('click', async () => {
       await A.api('POST', '/api/admin/logout').catch(() => {});
-      clearInterval(pollTimer); me = null; loginScreen();
+      expire('You signed out.');
     });
     const side = document.getElementById('side'), menuBtn = document.getElementById('menuBtn');
     menuBtn.addEventListener('click', () => { const on = side.classList.toggle('on'); menuBtn.setAttribute('aria-expanded', on); });
@@ -141,13 +221,14 @@
 
   async function refreshCounts() {
     try {
-      const r = await A.api('GET', '/api/admin/overview');
+      const r = await A.api('GET', '/api/admin/overview', undefined, { bg: true });
       counts = r.counts; settings = r.settings;
+      if (settings.admin_idle_minutes) idleMinutes = settings.admin_idle_minutes;
       document.querySelectorAll('[data-count]').forEach((el) => {
         const n = counts[el.dataset.count] || 0;
         el.textContent = n; el.hidden = !n;
       });
-    } catch (e) { if (e.status === 401) { clearInterval(pollTimer); loginScreen(); } }
+    } catch (e) { /* a 401 is handled by the A.api wrapper */ }
   }
 
   function route() {
@@ -157,7 +238,7 @@
     if (!v) id = 'requests';
     document.querySelectorAll('[data-view]').forEach((a) => a.setAttribute('aria-current', a.dataset.view === id ? 'page' : 'false'));
     closeDrawer();
-    ({ requests, payments, upcoming, all, block, admins, settings: settingsView, activity, password }[id])();
+    ({ requests, payments, upcoming, all, new: newBooking, block, admins, settings: settingsView, activity, password }[id])();
   }
 
   const main = () => document.getElementById('main');
@@ -165,7 +246,8 @@
   // ---------- booking lists ----------
 
   function rowHtml(b) {
-    const cust = b.customer ? `${esc(b.customer.name)}<div class="muted">${esc(b.customer.email)}</div>` : '<span class="muted">Blocked by venue</span>';
+    const via = b.source && b.source !== 'website' ? ` · via ${esc(b.source)}` : '';
+    const cust = b.customer ? `${esc(b.customer.name)}<div class="muted">${esc(b.customer.email || b.customer.phone)}${via}</div>` : '<span class="muted">Blocked by venue</span>';
     return `<tr data-id="${b.id}" tabindex="0">
       <td><strong>${esc(A.fmtDate(b.date))}</strong><div class="muted">${A.fmtHour(b.start)}–${A.fmtHour(b.end)}</div></td>
       <td>${esc(b.eventType)}<div class="muted">${esc(b.ref)}</div></td>
@@ -240,11 +322,21 @@
         <label class="fld"><span>Message to the customer (included in the email)</span><textarea id="note" maxlength="600"></textarea></label>
         <p class="form-err" role="alert"></p>
         <div class="row2"><button class="btn btn-danger" type="button" data-act="reject-slip">Slip doesn't match</button><button class="btn btn-primary" type="button" data-act="confirm">Payment received, confirm</button></div></div>`;
-    } else if (['approved', 'confirmed', 'blocked'].includes(b.status)) {
+    } else if (b.status === 'approved') {
       actions = `<div class="actbox">
-        <label class="fld"><span>Reason (sent to the customer)</span><textarea id="note" maxlength="600"></textarea></label>
+        <p class="hint" style="margin:0">Got the money another way (cash, a transfer you can see, a slip sent on WhatsApp)? Attach the slip if you have one, then confirm.</p>
+        <label class="fld"><span>Message to the customer (included in the email)</span><textarea id="note" maxlength="600"></textarea></label>
+        <p class="form-err" role="alert"></p>
+        <div class="row2"><button class="btn btn-danger" type="button" data-act="cancel">Cancel booking</button><button class="btn btn-primary" type="button" data-act="confirm">Payment received, confirm</button></div></div>`;
+    } else if (['confirmed', 'blocked'].includes(b.status)) {
+      actions = `<div class="actbox">
+        <label class="fld"><span>${b.status === 'blocked' ? 'Note' : 'Reason (sent to the customer)'}</span><textarea id="note" maxlength="600"></textarea></label>
         <p class="form-err" role="alert"></p>
         <div><button class="btn btn-danger" type="button" data-act="cancel">${b.status === 'blocked' ? 'Remove block' : 'Cancel booking'}</button></div></div>`;
+    }
+    if (['approved', 'slip_uploaded', 'confirmed'].includes(b.status)) {
+      actions += `<div class="actbox"><label class="btn btn-ghost file-pick" style="justify-self:start">${b.hasSlip ? 'Replace slip or receipt' : 'Attach slip or receipt'}
+        <input type="file" id="adminSlip" accept="image/jpeg,image/png,image/webp,application/pdf"></label></div>`;
     }
     d.innerHTML = `<button class="modal-x" type="button" aria-label="Close">×</button>
       <h2>${esc(b.eventType)}</h2>${A.chip(b.status)}
@@ -254,7 +346,8 @@
         <dt>Time</dt><dd>${A.fmtHour(b.start)} to ${A.fmtHour(b.end)} (${hrs} h)</dd>
         <dt>Guests</dt><dd>${b.guests || '–'}</dd>
         <dt>Amount</dt><dd>${b.amount ? esc(A.fmtMoney(cur, b.amount)) : '–'}</dd>
-        ${b.customer ? `<dt>Customer</dt><dd>${esc(b.customer.name)}<br><a href="mailto:${esc(b.customer.email)}">${esc(b.customer.email)}</a>${b.customer.phone ? `<br>${esc(b.customer.phone)}` : ''}</dd>` : ''}
+        ${b.customer ? `<dt>Customer</dt><dd>${esc(b.customer.name)}${b.customer.email ? `<br><a href="mailto:${esc(b.customer.email)}">${esc(b.customer.email)}</a>` : ''}${b.customer.phone ? `<br><a href="tel:${esc(b.customer.phone.replace(/[^\d+]/g, ''))}">${esc(b.customer.phone)}</a>` : ''}${!b.customer.email ? '<br><span class="muted">No email, so no automatic emails</span>' : ''}</dd>` : ''}
+        ${b.source && b.source !== 'website' ? `<dt>Came in via</dt><dd>${esc(b.source)}${b.createdBy ? `, added by ${esc(b.createdBy)}` : ''}</dd>` : ''}
         ${b.notes ? `<dt>${b.status === 'blocked' ? 'Reason' : 'Their notes'}</dt><dd>${esc(b.notes)}</dd>` : ''}
         ${b.vendorNote ? `<dt>Your note</dt><dd>${esc(b.vendorNote)}</dd>` : ''}
         ${b.payBy && b.status === 'approved' ? `<dt>Pay by</dt><dd>${esc(A.fmtWhen(b.payBy))}</dd>` : ''}
@@ -269,6 +362,15 @@
       ${b.customer && RESEND_LABEL[b.status] ? `<div class="actbox"><p class="hint" style="margin:0">Customer didn't get it, or it went to spam?</p>
         <div><button class="btn btn-ghost" type="button" id="resend">Resend ${esc(RESEND_LABEL[b.status])} email</button></div></div>` : ''}`;
     d.querySelector('.modal-x').addEventListener('click', closeDrawer);
+    const as = d.querySelector('#adminSlip');
+    if (as) as.addEventListener('change', async () => {
+      const file = as.files[0]; if (!file) return;
+      if (file.size > 5 * 1024 * 1024) { A.toast('That file is larger than 5 MB.', 'error'); as.value = ''; return; }
+      const fd = new FormData(); fd.append('slip', file);
+      as.parentElement.firstChild.textContent = 'Uploading…';
+      try { await A.api('POST', `/api/admin/bookings/${b.id}/slip`, fd); A.toast('Slip attached.'); refreshCounts(); openBooking(b.id, onChange); if (onChange) onChange(); }
+      catch (e) { A.toast(e.message, 'error'); openBooking(b.id, onChange); }
+    });
     const rs = d.querySelector('#resend');
     if (rs) rs.addEventListener('click', () => A.busy(rs, 'Sending…', () => A.api('POST', `/api/admin/bookings/${b.id}/resend-email`, {}))
       .then((r) => A.toast(`Sent the ${r.sent} email to ${r.to}.`))
@@ -295,6 +397,121 @@
   }
 
   const RESEND_LABEL = { pending: 'request received', approved: 'payment details', confirmed: 'confirmation', rejected: 'declined', cancelled: 'cancellation' };
+
+  // ---------- new booking (requests by phone, WhatsApp, Instagram, walk-in…) ----------
+
+  async function newBooking() {
+    const m = main();
+    m.innerHTML = '<h1>New booking</h1><p class="sub">Loading…</p>';
+    const cfg = await A.loadConfig();
+    const s = settings;
+    const today = cfg.today;
+    const hourOpts = (from, to, sel) => Array.from({ length: to - from + 1 }, (_, i) => from + i)
+      .map((h) => `<option value="${h}" ${h === sel ? 'selected' : ''}>${A.fmtHour(h)}${h < s.open_hour || h > s.close_hour ? ' (outside hours)' : ''}</option>`).join('');
+    const defStart = Math.min(Math.max(18, s.open_hour), Math.max(s.open_hour, s.close_hour - s.min_hours));
+    const defEnd = Math.min(s.close_hour, defStart + Math.max(4, s.min_hours));
+    m.innerHTML = `<h1>New booking</h1><p class="sub">For requests that came in by phone, WhatsApp, Instagram, email or in person. It's saved just like a website booking.</p>
+      <form class="form" novalidate id="nb" style="max-width:760px" autocomplete="off">
+        <div class="panel"><h2>Customer</h2>
+          <div class="grid2">
+            <label class="fld"><span>Name</span><input name="name" required maxlength="80"></label>
+            <label class="fld"><span>Came in through</span><select name="source">${cfg.sources.map((x) => `<option>${esc(x)}</option>`).join('')}</select></label>
+            <label class="fld"><span>Phone</span><input name="phone" type="tel" maxlength="24" placeholder="+960 7xx xxxx"></label>
+            <label class="fld"><span>Email (optional, needed for automatic emails)</span><input name="email" type="email" maxlength="190"></label>
+          </div>
+          <p class="hint" style="margin-top:10px">With an email, the booking also appears on the customer's <em>My bookings</em> page if they sign in with that address later.</p>
+        </div>
+        <div class="panel"><h2>Event</h2>
+          <div class="grid2">
+            <label class="fld"><span>Event</span><select name="eventType">${cfg.eventTypes.map((x) => `<option>${esc(x)}</option>`).join('')}</select></label>
+            <label class="fld"><span>Guests</span><input name="guests" type="number" min="1" value="100" inputmode="numeric"></label>
+            <label class="fld"><span>Date</span><input name="date" type="date" min="${today}" required></label>
+            <div class="row2"><label class="fld"><span>From</span><select name="start">${hourOpts(0, 23, defStart)}</select></label>
+            <label class="fld"><span>To</span><select name="end">${hourOpts(1, 24, defEnd)}</select></label></div>
+          </div>
+          <div class="astrip" id="nbStrip" aria-hidden="true"></div>
+          <p class="nb-avail" id="nbAvail" aria-live="polite">Pick a date to check availability.</p>
+          <label class="fld" style="margin-top:6px"><span>Customer's notes or requests (optional)</span><textarea name="notes" maxlength="1000" placeholder="Theme, set-up time, catering, decorations…"></textarea></label>
+        </div>
+        <div class="panel"><h2>Status and payment</h2>
+          <div class="grid2">
+            <label class="fld"><span>Status</span><select name="status">
+              <option value="approved">Approved, waiting for payment</option>
+              <option value="confirmed">Confirmed, already paid</option>
+              <option value="pending">Pending, decide later</option></select></label>
+            <label class="fld"><span>Amount (${esc(s.currency)})</span><input name="amount" type="number" min="0" step="1"></label>
+          </div>
+          <p class="hint" id="nbPrice" style="margin-top:8px"></p>
+          <label class="fld" style="margin-top:10px"><span>Message to the customer (optional, included in the email)</span><textarea name="note" maxlength="600"></textarea></label>
+          <label style="display:flex;gap:10px;align-items:center;margin-top:12px;font-size:15px"><input type="checkbox" name="notify" checked disabled> <span id="nbNotifyLabel">Email the customer (add an email above)</span></label>
+        </div>
+        <p class="form-err" role="alert"></p>
+        <div><button class="btn btn-primary" type="submit">Save booking</button></div>
+      </form>`;
+
+    const form = document.getElementById('nb');
+    const F = (n) => form.elements[n];
+    let amountTouched = false, avail = { days: {} }, lastMonth = '';
+    F('amount').addEventListener('input', () => { amountTouched = true; });
+
+    function price() {
+      const h = Number(F('end').value) - Number(F('start').value);
+      document.getElementById('nbPrice').textContent = h > 0 ? `${h} hours × ${A.fmtMoney(s.currency, s.hourly_rate)} = ${A.fmtMoney(s.currency, h * s.hourly_rate)}. Change the amount for discounts or extras.` : '';
+      if (!amountTouched && h > 0) F('amount').value = h * s.hourly_rate;
+    }
+    function notifyState() {
+      const has = /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(F('email').value.trim());
+      F('notify').disabled = !has;
+      const st = F('status').value;
+      document.getElementById('nbNotifyLabel').textContent = !has ? 'Email the customer (add an email above)'
+        : st === 'approved' ? 'Email the customer the payment details' : st === 'confirmed' ? 'Email the customer a booking confirmation' : 'Email the customer that we got their request';
+    }
+    const within = (h, ranges) => ranges.some((r) => h >= r[0] && h < r[1]);
+    async function check() {
+      price();
+      const d = F('date').value, st = Number(F('start').value), en = Number(F('end').value);
+      const strip = document.getElementById('nbStrip'), msg = document.getElementById('nbAvail');
+      msg.dataset.tone = '';
+      if (!d) { strip.innerHTML = ''; msg.textContent = 'Pick a date to check availability.'; return; }
+      const month = d.slice(0, 7);
+      if (month !== lastMonth) {
+        try { avail = await A.api('GET', `/api/availability?month=${month}`); lastMonth = month; }
+        catch (e) { msg.textContent = e.message; return; }
+      }
+      if (F('date').value !== d) return;
+      const day = avail.days[d] || { booked: [], requested: [] };
+      let html = '', clash = false, asked = false;
+      for (let h = 0; h < 24; h++) {
+        const sel = h >= st && h < en, booked = within(h, day.booked), req = within(h, day.requested);
+        if (sel && booked) clash = true;
+        if (sel && req) asked = true;
+        html += `<span class="ah ${booked ? 'booked' : req ? 'req' : ''} ${sel ? 'sel' : ''} ${h < s.open_hour || h >= s.close_hour ? 'off' : ''}" title="${A.fmtHour(h)}"></span>`;
+      }
+      strip.innerHTML = html + `<span class="al">12am</span><span class="am">12pm</span><span class="ar">12am</span>`;
+      if (en <= st) { msg.textContent = 'The end time needs to be after the start.'; msg.dataset.tone = 'bad'; return; }
+      const taken = day.booked.map((r) => `${A.fmtHour(r[0])}–${A.fmtHour(r[1])}`).join(', ');
+      if (clash) { msg.textContent = `Already booked: ${taken}. Choose other hours, or save it as "Pending" to decide later.`; msg.dataset.tone = 'bad'; }
+      else if (asked) { msg.textContent = 'Free, but a website request is waiting for part of these hours. Saving this as approved or confirmed will block that request.'; msg.dataset.tone = 'warn'; }
+      else { msg.textContent = `Free${taken ? `. Other bookings that day: ${taken}` : ''}.`; msg.dataset.tone = 'ok'; }
+    }
+    ['date', 'start', 'end'].forEach((n) => F(n).addEventListener('change', check));
+    F('email').addEventListener('input', notifyState);
+    F('status').addEventListener('change', notifyState);
+    price(); notifyState();
+
+    formSubmit(form, 'Saving…', async (v) => {
+      if (String(v.name || '').trim().length < 2) throw new Error("Enter the customer's name.");
+      if (!v.phone && !v.email) throw new Error('Enter a phone number or an email, so you can reach the customer.');
+      if (!v.date) throw new Error('Pick a date.');
+      const body = { ...v, start: Number(v.start), end: Number(v.end), guests: Number(v.guests), notify: !F('notify').disabled && F('notify').checked };
+      const r = await A.api('POST', '/api/admin/bookings', body);
+      const emailed = r.emailed === 'sent' ? ' Email sent.' : r.emailed ? ` The email couldn't be sent: ${r.emailed}` : '';
+      A.toast(`Saved ${r.booking.ref}.${emailed}`, r.emailed && r.emailed !== 'sent' ? 'error' : '');
+      refreshCounts();
+      openBooking(r.booking.id);
+      form.reset(); amountTouched = false; lastMonth = ''; price(); notifyState(); check();
+    });
+  }
 
   // ---------- block time ----------
 
@@ -407,6 +624,7 @@
           ${f('open_hour', 'Opens at (0–23)', 'number', 'min="0" max="23"')}${f('close_hour', 'Closes at (1–24)', 'number', 'min="1" max="24"')}
           ${f('min_hours', 'Minimum hours per booking', 'number', 'min="1" max="24"')}${f('max_guests', 'Maximum guests', 'number', 'min="1"')}
           ${f('pay_within_hours', 'Hours to pay after approval (0 = no limit)', 'number', 'min="0"')}
+          ${f('admin_idle_minutes', 'Sign staff out after this many minutes without activity', 'number', 'min="5" max="480"')}
         </div></div>
         <div class="panel"><h2>Bank transfer details</h2><div class="grid2">
           ${f('bank_name', 'Bank')}${f('account_name', 'Account name')}${f('account_number', 'Account number')}
@@ -438,7 +656,7 @@
     const m = main();
     m.innerHTML = '<h1>Activity log</h1><p class="sub">The last 200 admin actions, including failed sign-ins.</p><div id="log"><p class="muted">Loading…</p></div>';
     const { entries } = await A.api('GET', '/api/admin/audit');
-    const labels = { login: 'Signed in', login_failed: 'Failed sign-in', approve: 'Approved', reject: 'Rejected', confirm: 'Confirmed payment', 'reject-slip': 'Rejected slip', cancel: 'Cancelled', block: 'Blocked time', settings: 'Changed settings', admin_added: 'Added admin', admin_disabled: 'Disabled admin', admin_updated: 'Updated admin', admin_password_reset: 'Reset admin password', admin_removed: 'Removed admin', master_transferred: 'Handed over master', password_changed: 'Changed own password', setup: 'Setup', resend_email: 'Resent email', test_email: 'Sent test email' };
+    const labels = { login: 'Signed in', login_failed: 'Failed sign-in', approve: 'Approved', reject: 'Rejected', confirm: 'Confirmed payment', 'reject-slip': 'Rejected slip', cancel: 'Cancelled', block: 'Blocked time', settings: 'Changed settings', admin_added: 'Added admin', admin_disabled: 'Disabled admin', admin_updated: 'Updated admin', admin_password_reset: 'Reset admin password', admin_removed: 'Removed admin', master_transferred: 'Handed over master', password_changed: 'Changed own password', setup: 'Setup', resend_email: 'Resent email', test_email: 'Sent test email', manual_booking: 'Added a booking', slip_added: 'Attached a slip' };
     document.getElementById('log').innerHTML = entries.length ? `<table class="table" style="display:table"><thead><tr><th>When</th><th>Who</th><th>What</th><th>Details</th><th>IP</th></tr></thead><tbody>
       ${entries.map((e) => `<tr style="cursor:default"><td class="muted">${esc(A.fmtWhen(e.at))}</td><td>${esc(e.username || '–')}</td><td>${esc(labels[e.action] || e.action)}</td><td>${esc(e.detail)}</td><td class="muted">${esc(e.ip)}</td></tr>`).join('')}
       </tbody></table>` : '<div class="panel">No activity yet.</div>';
@@ -464,9 +682,11 @@
       if (st.needsSetup) return setupScreen(st.setupEnabled);
       if (!st.admin) return loginScreen();
       me = st.admin;
+      if (st.idleMinutes) idleMinutes = st.idleMinutes;
     }
     if (me.mustChange) return mustChangeScreen();
     shell();
+    startIdle();
     await refreshCounts();
     route();
     clearInterval(pollTimer);

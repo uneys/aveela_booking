@@ -139,11 +139,20 @@ If you connected the repository under **Workers & Pages → Pages → Connect to
    - `PEPPER` (**Secret**): at least 32 random characters. Never change or lose it
    - `SETUP_TOKEN` (**Secret**): a long random string
    - Later, as needed: `GMAIL_USER` + `GMAIL_APP_PASSWORD` (section 2), `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET` and the `APPLE_…` secrets (all **Secret**)
-5. **Create the tables**: Storage & databases → D1 → `aveela` → **Console**. Paste the whole of `migrations/0001_initial.sql` and run it. For future migrations, paste each new file the same way.
+5. **Create the tables**: Storage & databases → D1 → `aveela` → **Console**. Paste the whole of `migrations/0001_initial.sql` and run it, then do the same with `migrations/0002_manual_bookings_and_timeouts.sql`. Run each file once, in number order. When an update adds a new file, paste just that one.
 6. **Redeploy**: bindings and variables only apply to new deployments. Go to Deployments → the latest one → ⋯ → **Retry deployment**.
 7. Open `https://aveela.pages.dev/api/health`. When it shows `"ok":true`, go to `/admin` to create the master admin, then delete `SETUP_TOKEN`.
 
 On Pages there are no scheduled jobs. Unpaid approvals still expire on time, because that's checked whenever bookings are read, and old sessions are tidied up during normal traffic.
+
+---
+
+## Updating a site that's already live
+
+When an update adds a file to `migrations/`, the database needs it once:
+
+- **Cloudflare Pages:** D1 → `aveela` → Console → paste the new file (e.g. `0002_manual_bookings_and_timeouts.sql`) → run. Do this before or right after uploading the new code. Until then, sign-in keeps working, but the parts that need the update show a message telling you to run it, and `/api/health` lists it.
+- **Workers with the GitHub workflow:** applied automatically on the next push.
 
 ---
 
@@ -244,6 +253,28 @@ The Google button appears automatically; no redeploy needed.
 
 ---
 
+## Manual bookings (phone, WhatsApp, Instagram, walk-in)
+
+Admin panel → **New booking** records a request that didn't come through the website. It collects the same details as the website form:
+
+- **Customer:** name, phone and/or email, and where the request came from (phone call, WhatsApp, Viber, Instagram, Facebook, email, walk-in, other)
+- **Event:** event type, guests, date, start and end hour, and the customer's notes. The form shows that day's booked and requested hours as you pick times.
+- **Status:** *Approved, waiting for payment* (holds the hours and starts the payment deadline), *Confirmed, already paid*, or *Pending, decide later*. Pending may overlap other requests; the other two can't overlap a held booking.
+- **Amount:** filled in as hours × price per hour, and you can change it. You can also add a message to the customer.
+- **Email the customer:** with an email address, the booking can send the matching email (request received, payment details or confirmation). Without one, no automatic emails go out, so contact them yourself.
+
+Manual bookings then work exactly like website bookings: they appear in the lists with "via WhatsApp" and so on, hold the hours on the public calendar, and can be approved, confirmed or cancelled. For any approved booking, staff can **attach a slip or receipt** themselves and press **Payment received, confirm**, e.g. for cash or a slip sent on WhatsApp.
+
+If you enter the customer's email, the booking is linked to it. When that person later signs up on the website with the same email, they're emailed a link to set a password, and the booking appears on their *My bookings* page.
+
+## Sign-out after inactivity
+
+- **Admin panel:** staff are signed out after **30 minutes** without activity (mouse, keyboard or touch). Two minutes before, a *Still there?* message counts down with **Stay signed in**. The master admin can change the time in **Settings** (5 to 480 minutes). Activity in any open tab counts. The panel's once-a-minute refresh doesn't, so a screen left open still times out. Admin sessions also end after 8 hours regardless.
+- **Customers:** signed out after 14 days without visiting, and after 30 days regardless.
+- Timeouts are enforced by the server too, not just the page.
+
+---
+
 ## How the booking flow works
 
 ```
@@ -273,6 +304,7 @@ not paid in time ─────────────────────
 The free plan gives a Worker 10 ms of CPU per request, and Workers caps PBKDF2 at 100,000 rounds (about 25 ms). Splitting the work keeps sign-in inside the limit, while someone who steals the database still has to pay for all 620,000 rounds for every guess, and can't even start without the pepper. If you move to Workers Paid, raise `SERVER_HASH_ITERATIONS` to `100000`. Existing hashes upgrade automatically the next time each person signs in.
 
 **Admin panel**
+- Signed out after 30 minutes without activity (adjustable), with a warning first. Sessions last at most 8 hours.
 - Separate admin session cookie: `__Host-` prefixed, HttpOnly, Secure, SameSite=Strict, 8-hour expiry.
 - Sign-in locks for 15 minutes after 5 wrong passwords for an account, or 20 from one network.
 - New admins and reset passwords are temporary: the admin must choose their own password before doing anything.

@@ -4,8 +4,10 @@
 
   A.esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 
-  A.api = async function (method, path, body) {
+  // opts.bg: a background refresh, which the server doesn't count as activity for sign-out timeouts.
+  A.api = async function (method, path, body, { bg = false } = {}) {
     const opts = { method, headers: { 'x-aveela': '1' }, credentials: 'same-origin' };
+    if (bg) opts.headers['x-aveela-bg'] = '1';
     if (body instanceof FormData) opts.body = body;
     else if (body !== undefined) { opts.body = JSON.stringify(body); opts.headers['content-type'] = 'application/json'; }
     let res;

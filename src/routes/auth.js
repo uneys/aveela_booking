@@ -77,7 +77,14 @@ export async function handleAuth(request, env, ctx, url, path) {
     if (name.length < 2) throw bad('Enter your name.');
     if (!validPrehash(body.pw)) throw bad('Password could not be processed. Reload the page and try again.');
     await hit(env, `signup:ip:${ip}`, 10);
-    const exists = await env.DB.prepare('SELECT id FROM users WHERE email = ?').bind(email).first();
+    const exists = await env.DB.prepare('SELECT id, email, password_hash, google_sub, apple_sub FROM users WHERE email = ?').bind(email).first();
+    if (exists && !exists.password_hash && !exists.google_sub && !exists.apple_sub) {
+      // The venue booked for this email by phone/WhatsApp. Prove it's theirs by email before setting a password.
+      await hit(env, `forgot:acct:${email}`, 3);
+      const token = await issueToken(env, 'reset', exists.id, 3600 * 1000);
+      ctx.waitUntil(mail.reset(env, exists.email, `${env.APP_URL}/account?reset=${token}`));
+      throw conflict("The venue already has bookings under this email. We've emailed you a link to set your password and see them.", 'claim');
+    }
     if (exists) throw conflict('An account with this email already exists. Sign in instead.', 'exists');
     const hash = await hashPassword(env, body.pw);
     const r = await env.DB.prepare('INSERT INTO users (email, name, phone, password_hash, email_verified, created_at) VALUES (?,?,?,?,0,?) RETURNING *')
@@ -101,7 +108,8 @@ export async function handleAuth(request, env, ctx, url, path) {
     if (!ok) {
       await hit(env, `login:acct:${email}`, 8);
       await hit(env, `login:ip:${ip}`, 30);
-      if (u && !u.password_hash) throw unauthorized(`This account uses ${u.google_sub ? 'Google' : 'Apple'} sign-in. Use that button, or reset your password to add one.`);
+      if (u && !u.password_hash && (u.google_sub || u.apple_sub)) throw unauthorized(`This account uses ${u.google_sub ? 'Google' : 'Apple'} sign-in. Use that button, or reset your password to add one.`);
+      if (u && !u.password_hash) throw unauthorized('No password is set for this email yet. Use "Forgot your password?" to set one and see your bookings.');
       throw unauthorized('Email or password is incorrect.');
     }
     await clearHits(env, `login:acct:${email}`);

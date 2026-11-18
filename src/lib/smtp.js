@@ -90,7 +90,9 @@ export async function smtpSend({ host = 'smtp.gmail.com', port = 465, user, pass
     await Promise.race([work, timeout]);
   } catch (e) {
     const m = String(e.message || e);
-    if (/\b535\b/.test(m)) throw new Error('Gmail rejected the sign-in. Use a Google App Password (not your normal password) and check GMAIL_USER.');
+    const code = (m.match(/\b(5\d\d[ -]\d\.\d\.\d+)/) || [])[1] || '';
+    if (/\b534\b/.test(m)) throw new Error(`Gmail needs an App Password, not the normal Google password (Gmail code ${code}). Create one at myaccount.google.com/apppasswords and put it in GMAIL_APP_PASSWORD.`);
+    if (/\b535\b/.test(m)) throw new Error(`Gmail rejected the sign-in (Gmail code ${code}): the address in GMAIL_USER and the App Password in GMAIL_APP_PASSWORD don't match. Check both, or create a new App Password on that same account.`);
     if (/\b550 5\.4\.5\b|quota/i.test(m)) throw new Error('Gmail daily sending limit reached. It resets within 24 hours.');
     throw e;
   } finally {

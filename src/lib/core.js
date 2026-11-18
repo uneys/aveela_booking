@@ -9,9 +9,9 @@ export const now = () => Date.now();
 export const SETTING_DEFAULTS = {
   hourly_rate: '2500', currency: 'MVR', open_hour: '8', close_hour: '24', min_hours: '2',
   max_guests: '250', pay_within_hours: '48', bank_name: '', account_name: '', account_number: '',
-  payment_note: 'Please use your booking reference as the transfer remark.', notify_email: '',
+  payment_note: 'Please use your booking reference as the transfer remark.', notify_email: '', admin_idle_minutes: '30',
 };
-export const NUMERIC_SETTINGS = ['hourly_rate', 'open_hour', 'close_hour', 'min_hours', 'max_guests', 'pay_within_hours'];
+export const NUMERIC_SETTINGS = ['hourly_rate', 'open_hour', 'close_hour', 'min_hours', 'max_guests', 'pay_within_hours', 'admin_idle_minutes'];
 
 export async function getSettings(env) {
   const { results } = await env.DB.prepare('SELECT key, value FROM settings').all();
@@ -24,27 +24,69 @@ export async function getSettings(env) {
 
 // ---------- sessions ----------
 
+// ttl: longest a session can last. idle: signed out after this long without activity.
+// The admin idle time is a setting (admin_idle_minutes, default 30); customers get 14 days.
 const SESSION = {
-  user: { cookie: '__Host-aveela_s', ttl: 30 * 24 * 3600 * 1000, sameSite: 'Lax' },
+  user: { cookie: '__Host-aveela_s', ttl: 30 * 24 * 3600 * 1000, idle: 14 * 24 * 3600 * 1000, sameSite: 'Lax' },
   admin: { cookie: '__Host-aveela_a', ttl: 8 * 3600 * 1000, sameSite: 'Strict' },
 };
+const TOUCH_EVERY = 60 * 1000; // write last_seen at most once a minute
+const endedBy = new WeakMap(); // request -> 'idle' | 'expired', for a clearer message
+
+export const sessionEndReason = (request) => endedBy.get(request) || null;
+const missingColumn = (e) => /no such column|has no column named/i.test(String((e && e.message) || e));
+
+async function idleLimit(env, kind) {
+  if (kind === 'user') return SESSION.user.idle;
+  const row = await env.DB.prepare("SELECT value FROM settings WHERE key = 'admin_idle_minutes'").first();
+  const min = parseInt(row ? row.value : '30', 10);
+  return Math.min(Math.max(Number.isFinite(min) && min > 0 ? min : 30, 5), 480) * 60 * 1000;
+}
 
 export async function createSession(env, kind, subjectId, ip) {
   const token = randomToken(32);
   const cfg = SESSION[kind];
   const t = now();
-  await env.DB.prepare('INSERT INTO sessions (token_hash, kind, subject_id, expires_at, created_at, ip) VALUES (?,?,?,?,?,?)')
-    .bind(await sha256(token), kind, subjectId, t + cfg.ttl, t, ip || '').run();
+  const h = await sha256(token);
+  try {
+    await env.DB.prepare('INSERT INTO sessions (token_hash, kind, subject_id, expires_at, created_at, ip, last_seen) VALUES (?,?,?,?,?,?,?)')
+      .bind(h, kind, subjectId, t + cfg.ttl, t, ip || '', t).run();
+  } catch (e) {
+    if (!missingColumn(e)) throw e; // database not updated to migration 0002 yet: still let people sign in
+    await env.DB.prepare('INSERT INTO sessions (token_hash, kind, subject_id, expires_at, created_at, ip) VALUES (?,?,?,?,?,?)')
+      .bind(h, kind, subjectId, t + cfg.ttl, t, ip || '').run();
+  }
   return cookie(cfg.cookie, token, { maxAge: cfg.ttl / 1000, sameSite: cfg.sameSite });
 }
 
+// Background requests (the admin panel's once-a-minute refresh) send x-aveela-bg: 1 and don't
+// count as activity, so an unattended screen still times out.
 export async function readSession(env, request, kind) {
   const cfg = SESSION[kind];
   const token = parseCookies(request)[cfg.cookie];
   if (!token || token.length > 100) return null;
-  const row = await env.DB.prepare('SELECT subject_id, expires_at FROM sessions WHERE token_hash = ? AND kind = ?')
-    .bind(await sha256(token), kind).first();
-  if (!row || row.expires_at < now()) return null;
+  const h = await sha256(token);
+  const t = now();
+  let row;
+  try {
+    row = await env.DB.prepare('SELECT subject_id, expires_at, last_seen, created_at FROM sessions WHERE token_hash = ? AND kind = ?').bind(h, kind).first();
+  } catch (e) {
+    if (!missingColumn(e)) throw e;
+    row = await env.DB.prepare('SELECT subject_id, expires_at FROM sessions WHERE token_hash = ? AND kind = ?').bind(h, kind).first();
+    if (!row || row.expires_at < t) return null;
+    return row.subject_id;
+  }
+  if (!row) return null;
+  if (row.expires_at < t) { endedBy.set(request, 'expired'); return null; }
+  const last = row.last_seen || row.created_at;
+  if (t - last > (await idleLimit(env, kind))) {
+    await env.DB.prepare('DELETE FROM sessions WHERE token_hash = ?').bind(h).run();
+    endedBy.set(request, 'idle');
+    return null;
+  }
+  if (request.headers.get('x-aveela-bg') !== '1' && t - last > TOUCH_EVERY) {
+    await env.DB.prepare('UPDATE sessions SET last_seen = ? WHERE token_hash = ?').bind(t, h).run();
+  }
   return row.subject_id;
 }
 

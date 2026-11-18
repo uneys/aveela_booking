@@ -31,6 +31,10 @@ async function health(env, url) {
   if (env.DB) {
     try { await env.DB.prepare('SELECT COUNT(*) AS n FROM settings').first(); checks.tables = true; }
     catch { problems.push('Database tables are missing. Paste migrations/0001_initial.sql into the D1 console (Storage & databases → D1 → aveela → Console) and run it.'); }
+    if (checks.tables) {
+      try { await env.DB.prepare('SELECT source, customer_name FROM bookings LIMIT 1').all(); await env.DB.prepare('SELECT last_seen FROM sessions LIMIT 1').all(); checks.databaseVersion = 2; }
+      catch { checks.databaseVersion = 1; problems.push('The database needs an update for manual bookings and sign-out timeouts. Paste migrations/0002_manual_bookings_and_timeouts.sql into the D1 console and run it once.'); }
+    }
   }
   const p = setupProblem(env); if (p) problems.unshift(p);
   if (env.APP_URL && !checks.appUrlMatches) problems.push(`APP_URL in wrangler.jsonc is ${env.APP_URL} but this site is ${url.origin}. Links in emails and Google/Apple sign-in need them to match.`);
@@ -87,6 +91,9 @@ export default {
       }
       console.log('Unhandled error', e && e.stack);
       const msg = String((e && e.message) || '');
+      if (/no such column|has no column named/i.test(msg)) {
+        return withSecurityHeaders(json({ error: 'The database needs an update. Paste migrations/0002_manual_bookings_and_timeouts.sql into the D1 console (Storage & databases → D1 → aveela → Console) and run it.', code: 'setup' }, 500), { noindex: true });
+      }
       if (/no such table/i.test(msg)) {
         return withSecurityHeaders(json({ error: 'Database tables are missing. Paste migrations/0001_initial.sql into the D1 console (Storage & databases → D1 → aveela → Console) and run it.', code: 'setup' }, 500), { noindex: true });
       }

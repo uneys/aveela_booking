@@ -206,3 +206,19 @@ body.admin{margin:0;background:#eef0f4;color:#1b2235;font-family:var(--sans);-we
 .admin .modal-card .btn-danger{color:var(--danger);border-color:rgba(255,143,128,.45)}
 .admin .modal-card .fld input{background:rgba(255,255,255,.06);border-color:rgba(245,241,234,.16);color:var(--pearl);color-scheme:dark}
 .admin .modal-card .form-err{color:var(--danger)}
+
+/* Admin: availability strip on the New booking form */
+.astrip{position:relative;display:grid;grid-template-columns:repeat(24,1fr);gap:2px;height:28px;margin:16px 0 26px}
+.astrip .ah{border-radius:3px;background:#dfe3ea}
+.astrip .ah.off{background:#eceef2}
+.astrip .ah.req{background:repeating-linear-gradient(135deg,#f6c56f 0 3px,#eef0f4 3px 6px)}
+.astrip .ah.booked{background:#8a90a3}
+.astrip .ah.sel{background:#18223a}
+.astrip .ah.sel.booked{background:#d64533}
+.astrip .al,.astrip .am,.astrip .ar{position:absolute;top:32px;font-size:11px;color:#6b7280}
+.astrip .al{left:0}.astrip .am{left:50%;transform:translateX(-50%)}.astrip .ar{right:0}
+.nb-avail{font-size:14.5px;margin:0;color:#3a4256}
+.nb-avail[data-tone=ok]{color:#1e7a4b}
+.nb-avail[data-tone=bad]{color:#c0392b}
+.nb-avail[data-tone=warn]{color:#9a5b00}
+.admin .warn{margin:0 0 16px}
