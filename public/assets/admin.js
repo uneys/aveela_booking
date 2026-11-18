@@ -182,10 +182,11 @@
 
   const VIEWS = [
     { id: 'requests', label: 'Requests', count: 'pending' },
+    { id: 'customers', label: 'Customers' },
+    { id: 'schedule', label: 'Schedule' },
     { id: 'payments', label: 'Payments to check', count: 'slip_uploaded' },
     { id: 'upcoming', label: 'Upcoming' },
     { id: 'all', label: 'All bookings' },
-    { id: 'customers', label: 'Customers' },
     { id: 'new', label: 'New booking' },
     { id: 'block', label: 'Block time' },
     { sep: true, master: true },
@@ -239,7 +240,7 @@
     if (!v) id = 'requests';
     document.querySelectorAll('[data-view]').forEach((a) => a.setAttribute('aria-current', a.dataset.view === id ? 'page' : 'false'));
     closeDrawer();
-    ({ requests, payments, upcoming, all, customers, new: newBooking, block, admins, settings: settingsView, activity, password }[id])();
+    ({ requests, payments, upcoming, all, customers, schedule, new: newBooking, block, admins, settings: settingsView, activity, password }[id])();
   }
 
   const main = () => document.getElementById('main');
@@ -574,6 +575,121 @@
       .catch((e) => { err.textContent = e.message; }));
   }
 
+  // ---------- schedule: a month at a glance ----------
+  // Each day shows its opening hours as a strip with bookings drawn in, tinted by how full it is.
+  // Clicking a day opens an hour-by-hour view of it.
+
+  const SHOW = ['pending', 'approved', 'slip_uploaded', 'confirmed', 'blocked'];
+  const LEGEND = [['confirmed', 'Confirmed'], ['slip_uploaded', 'Checking payment'], ['approved', 'Awaiting payment'], ['pending', 'Request'], ['blocked', 'Blocked']];
+  let schedMonth = null;
+
+  const iso = (d) => d.toISOString().slice(0, 10);
+  const who = (b) => (b.status === 'blocked' ? (b.notes || 'Blocked') : b.customer ? b.customer.name : '');
+
+  async function schedule() {
+    const m = main();
+    const cfg = await A.loadConfig();
+    if (!schedMonth) schedMonth = cfg.today.slice(0, 7);
+    const [y, mo] = schedMonth.split('-').map(Number);
+    const first = new Date(Date.UTC(y, mo - 1, 1)), last = new Date(Date.UTC(y, mo, 0));
+    const title = first.toLocaleDateString(undefined, { month: 'long', year: 'numeric', timeZone: 'UTC' });
+    m.innerHTML = `<div class="sch-head"><div><h1 class="sch-title">${esc(title)}</h1><p class="sub" style="margin:0">Every booking this month, hour by hour.</p></div>
+      <div class="sch-nav"><button class="btn btn-ghost btn-sm" type="button" data-nav="-1" aria-label="Previous month">‹</button>
+        <button class="btn btn-ghost btn-sm" type="button" data-nav="0">This month</button>
+        <button class="btn btn-ghost btn-sm" type="button" data-nav="1" aria-label="Next month">›</button></div></div>
+      <div id="schBody"><p class="muted">Loading…</p></div>`;
+    m.querySelectorAll('[data-nav]').forEach((b) => b.addEventListener('click', () => {
+      const n = +b.dataset.nav;
+      if (!n) schedMonth = cfg.today.slice(0, 7);
+      else { const d = new Date(Date.UTC(y, mo - 1 + n, 1)); schedMonth = iso(d).slice(0, 7); }
+      schedule();
+    }));
+    let bookings;
+    try { bookings = (await A.api('GET', `/api/admin/bookings?status=${SHOW.join(',')}&from=${iso(first)}&to=${iso(last)}`)).bookings; }
+    catch (e) { document.getElementById('schBody').innerHTML = `<p class="form-err">${esc(e.message)}</p>`; return; }
+
+    const open = settings.open_hour, close = settings.close_hour, span = Math.max(1, close - open);
+    const byDay = {};
+    bookings.forEach((b) => (byDay[b.date] ||= []).push(b));
+
+    // Month summary
+    const holding = bookings.filter((b) => b.status !== 'pending');
+    const hoursBooked = holding.filter((b) => b.status !== 'blocked').reduce((t, b) => t + (b.end - b.start), 0);
+    const capacity = last.getUTCDate() * span;
+    const occ = Math.round((holding.reduce((t, b) => t + Math.max(0, Math.min(b.end, close) - Math.max(b.start, open)), 0) / capacity) * 100);
+    const confirmedRev = bookings.filter((b) => b.status === 'confirmed').reduce((t, b) => t + b.amount, 0);
+    const dueRev = bookings.filter((b) => b.status === 'approved' || b.status === 'slip_uploaded').reduce((t, b) => t + b.amount, 0);
+    const requests = bookings.filter((b) => b.status === 'pending').length;
+    const busiest = Object.entries(byDay).map(([d, list]) => [d, list.filter((b) => b.status !== 'pending').reduce((t, b) => t + (b.end - b.start), 0)]).sort((a, b) => b[1] - a[1])[0];
+
+    // Calendar cells, weeks starting Monday
+    const lead = (first.getUTCDay() + 6) % 7;
+    const cells = [];
+    for (let i = 0; i < lead; i++) cells.push('<div class="sch-day sch-pad" aria-hidden="true"></div>');
+    for (let day = 1; day <= last.getUTCDate(); day++) {
+      const ds = `${schedMonth}-${String(day).padStart(2, '0')}`;
+      const list = (byDay[ds] || []).slice().sort((a, b) => a.start - b.start);
+      const held = list.filter((b) => b.status !== 'pending');
+      const fill = held.reduce((t, b) => t + Math.max(0, Math.min(b.end, close) - Math.max(b.start, open)), 0) / span;
+      const dow = new Date(ds + 'T12:00:00Z').getUTCDay();
+      const segs = list.map((b) => {
+        const s = Math.max(b.start, open), e = Math.min(b.end, close);
+        if (e <= s) return '';
+        return `<i class="bar s-${b.status}" style="left:${((s - open) / span) * 100}%;width:${((e - s) / span) * 100}%"></i>`;
+      }).join('');
+      const labels = list.slice(0, 2).map((b) => `<span class="lbl l-${b.status}">${A.fmtHour(b.start)} ${esc(b.status === 'blocked' ? 'Blocked' : b.eventType)}</span>`).join('');
+      const more = list.length > 2 ? `<span class="more">+${list.length - 2} more</span>` : '';
+      cells.push(`<button type="button" class="sch-day ${ds < cfg.today ? 'past' : ''} ${ds === cfg.today ? 'today' : ''} ${dow === 5 || dow === 6 ? 'wkend' : ''}" data-day="${ds}"
+          style="--fill:${Math.min(1, fill).toFixed(2)}" aria-label="${esc(A.fmtDate(ds, { weekday: 'long', month: 'long' }))}: ${list.length ? `${list.length} booking${list.length === 1 ? '' : 's'}` : 'free'}">
+        <span class="num">${day}</span>${held.length ? `<span class="pct">${Math.round(Math.min(1, fill) * 100)}%</span>` : ''}
+        <span class="strip">${segs}</span><span class="lbls">${labels}${more}</span></button>`);
+    }
+    const weekdays = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
+    document.getElementById('schBody').innerHTML = `
+      <div class="sch-sum">
+        <div><b>${holding.filter((b) => b.status !== 'blocked').length}</b><span>bookings</span></div>
+        <div><b>${hoursBooked}</b><span>hours booked</span></div>
+        <div class="occ"><b>${occ}%</b><span>of opening hours held</span><i style="--occ:${Math.min(100, occ)}%"></i></div>
+        <div><b>${esc(A.fmtMoney(settings.currency, confirmedRev))}</b><span>confirmed${dueRev ? `, plus ${esc(A.fmtMoney(settings.currency, dueRev))} awaiting payment` : ''}</span></div>
+        ${requests ? `<div><b>${requests}</b><span>request${requests === 1 ? '' : 's'} waiting</span></div>` : ''}
+        ${busiest && busiest[1] ? `<div><b>${esc(A.fmtDate(busiest[0], { weekday: 'short', year: undefined }))}</b><span>busiest day, ${busiest[1]} h</span></div>` : ''}
+      </div>
+      <div class="sch-legend">${LEGEND.map(([k, l]) => `<span><i class="sw s-${k}"></i>${esc(l)}</span>`).join('')}<span class="muted">Strips show ${A.fmtHour(open)}–${A.fmtHour(close)}</span></div>
+      <div class="sch-grid" role="grid">${weekdays.map((w) => `<div class="sch-wd">${w}</div>`).join('')}${cells.join('')}</div>`;
+    document.querySelectorAll('[data-day]').forEach((el) => el.addEventListener('click', () => openDay(el.dataset.day, byDay[el.dataset.day] || [], cfg)));
+  }
+
+  function openDay(ds, list, cfg) {
+    const d = document.getElementById('drawer');
+    const startH = Math.min(settings.open_hour, ...list.map((b) => b.start)), endH = Math.max(settings.close_hour, ...list.map((b) => b.end));
+    const rows = endH - startH, ROW = 44;
+    // Lay overlapping blocks (pending requests can overlap) side by side.
+    const sorted = list.slice().sort((a, b) => a.start - b.start || b.end - a.end);
+    const lanes = [];
+    sorted.forEach((b) => { let i = lanes.findIndex((end) => end <= b.start); if (i < 0) { i = lanes.length; lanes.push(0); } lanes[i] = b.end; b._lane = i; });
+    const nl = Math.max(1, lanes.length);
+    d.innerHTML = `<button class="modal-x" type="button" aria-label="Close">×</button>
+      <h2>${esc(A.fmtDate(ds, { weekday: 'long', month: 'long' }))}</h2>
+      <p class="sub" style="margin:0 0 16px">${list.length ? `${list.length} booking${list.length === 1 ? '' : 's'}` : 'Nothing booked yet.'}</p>
+      <div class="day-tl" style="height:${rows * ROW}px">
+        ${Array.from({ length: rows + 1 }, (_, i) => `<div class="hr" style="top:${i * ROW}px"><span>${A.fmtHour(startH + i)}</span></div>`).join('')}
+        ${Array.from({ length: rows }, (_, i) => { const h = startH + i; return h < settings.open_hour || h >= settings.close_hour ? `<div class="closed" style="top:${i * ROW}px;height:${ROW}px"></div>` : ''; }).join('')}
+        ${sorted.map((b) => `<button type="button" class="blk s-${b.status}" data-bid="${b.id}"
+            style="top:${(b.start - startH) * ROW + 2}px;height:${(b.end - b.start) * ROW - 4}px;left:calc(56px + (100% - 60px) * ${b._lane / nl});width:calc((100% - 60px) / ${nl} - 4px)">
+            <strong>${A.fmtHour(b.start)}–${A.fmtHour(b.end)} · ${esc(b.status === 'blocked' ? 'Blocked' : b.eventType)}</strong>
+            <span>${esc(who(b))}${b.guests ? ` · ${b.guests} guests` : ''}</span>
+            <span class="st">${esc((A.STATUS[b.status] || {}).label || b.status)}${b.source && b.source !== 'website' && b.status !== 'blocked' ? ` · via ${esc(b.source)}` : ''}</span></button>`).join('')}
+      </div>
+      ${ds >= cfg.today ? '<div class="actbox"><div class="row2"><button class="btn btn-primary" type="button" id="dayNew">New booking on this day</button><button class="btn btn-ghost" type="button" id="dayBlock">Block time</button></div></div>' : ''}`;
+    d.classList.add('on'); document.getElementById('shade').classList.add('on');
+    d.querySelector('.modal-x').addEventListener('click', closeDrawer);
+    d.querySelectorAll('[data-bid]').forEach((el) => el.addEventListener('click', () => openBooking(+el.dataset.bid, () => schedule())));
+    const nb = d.querySelector('#dayNew');
+    if (nb) nb.addEventListener('click', () => { try { sessionStorage.setItem('aveela_new_date', ds); } catch {} location.hash = 'new'; });
+    const bl = d.querySelector('#dayBlock');
+    if (bl) bl.addEventListener('click', () => { try { sessionStorage.setItem('aveela_block_date', ds); } catch {} location.hash = 'block'; });
+  }
+
   // ---------- new booking (requests by phone, WhatsApp, Instagram, walk-in…) ----------
 
   async function newBooking() {
@@ -673,6 +789,7 @@
       else { msg.textContent = `Free${taken ? `. Other bookings that day: ${taken}` : ''}.`; msg.dataset.tone = 'ok'; }
     }
     ['date', 'start', 'end'].forEach((n) => F(n).addEventListener('change', check));
+    try { const pre = sessionStorage.getItem('aveela_new_date'); sessionStorage.removeItem('aveela_new_date'); if (pre && pre >= today) { F('date').value = pre; setTimeout(check, 0); } } catch {}
     F('email').addEventListener('input', notifyState);
     F('status').addEventListener('change', notifyState);
     const payState = () => { document.getElementById('nbPayWrap').style.display = F('status').value === 'confirmed' ? '' : 'none'; };
@@ -708,6 +825,7 @@
         <label class="fld"><span>Reason (only staff see this)</span><input name="reason" maxlength="200" placeholder="Phone booking: Hassan, 7xx xxxx"></label>
         <p class="form-err" role="alert"></p><div><button class="btn btn-primary" type="submit">Block these hours</button></div></form></div>`;
     const form = m.querySelector('form');
+    try { const pre = sessionStorage.getItem('aveela_block_date'); sessionStorage.removeItem('aveela_block_date'); if (pre) form.elements.date.value = pre; } catch {}
     formSubmit(form, 'Saving…', async (f) => {
       if (!f.date) throw new Error('Pick a date.');
       const r = await A.api('POST', '/api/admin/blocks', { date: f.date, start: +f.start, end: +f.end, reason: f.reason });

@@ -204,12 +204,16 @@ export async function handleAdmin(request, env, ctx, url, path) {
     }
     if (scope === 'upcoming') { where.push("b.date >= date('now','-1 day')"); }
     if (scope === 'past') { where.push("b.date < date('now')"); }
+    // Date range, for the monthly schedule.
+    const from = url.searchParams.get('from'), to = url.searchParams.get('to');
+    if (isDate(from)) { where.push('b.date >= ?'); args.push(from); }
+    if (isDate(to)) { where.push('b.date <= ?'); args.push(to); }
     if (q) {
       where.push('(b.ref LIKE ? OR u.email LIKE ? OR u.name LIKE ? OR b.customer_name LIKE ? OR b.customer_email LIKE ? OR b.customer_phone LIKE ?)');
       args.push(...Array(6).fill(`%${q}%`));
     }
     const order = scope === 'upcoming' || status === 'pending' || status === 'slip_uploaded' ? 'b.date ASC, b.start_hour ASC' : 'b.date DESC, b.start_hour DESC';
-    const sql = `${BOOKING_SELECT} ${where.length ? 'WHERE ' + where.join(' AND ') : ''} ORDER BY ${order} LIMIT 200`;
+    const sql = `${BOOKING_SELECT} ${where.length ? 'WHERE ' + where.join(' AND ') : ''} ORDER BY ${isDate(from) ? 'b.date ASC, b.start_hour ASC' : order} LIMIT ${isDate(from) ? 1000 : 200}`;
     const { results } = await env.DB.prepare(sql).bind(...args).all();
     return json({ bookings: results.map(adminBooking) });
   }
