@@ -311,12 +311,25 @@
     const slipUrl = `/api/admin/bookings/${b.id}/slip`;
     let actions = '';
     if (b.status === 'pending') {
+      const hourOpts = (from, to, sel) => Array.from({ length: to - from + 1 }, (_, i) => from + i)
+        .map((h) => `<option value="${h}" ${h === sel ? 'selected' : ''}>${A.fmtHour(h)}</option>`).join('');
       actions = `<div class="actbox">
+        <h3 style="font:600 15px var(--sans);margin:0">Date and time <span class="muted" style="font-weight:400">(change before approving if needed)</span></h3>
+        <div class="grid2"><label class="fld"><span>Date</span><input id="rsDate" type="date" value="${esc(b.date)}"></label>
+          <label class="fld"><span>Guests</span><input id="rsGuests" type="number" min="1" value="${b.guests}"></label></div>
+        <div class="row2"><label class="fld"><span>From</span><select id="rsStart">${hourOpts(0, 23, b.start)}</select></label>
+          <label class="fld"><span>To</span><select id="rsEnd">${hourOpts(1, 24, b.end)}</select></label></div>
+        <p class="nb-avail" id="rsMsg" aria-live="polite"></p>
         <label class="fld"><span>Amount to charge (${esc(cur)})</span><input id="amount" type="number" min="0" step="1" value="${b.amount}"></label>
-        <p class="hint" style="margin-top:-6px">${hrs} hours × ${esc(A.fmtMoney(cur, settings.hourly_rate))} = ${esc(A.fmtMoney(cur, hrs * settings.hourly_rate))}. Change it for discounts or extras.</p>
+        <p class="hint" style="margin-top:-6px" id="rsPrice">${hrs} hours × ${esc(A.fmtMoney(cur, settings.hourly_rate))} = ${esc(A.fmtMoney(cur, hrs * settings.hourly_rate))}. Change it for discounts or extras.</p>
         <label class="fld"><span>Message to the customer (optional for approval, recommended when rejecting)</span><textarea id="note" maxlength="600"></textarea></label>
         <p class="form-err" role="alert"></p>
-        <div class="row2"><button class="btn btn-danger" type="button" data-act="reject">Reject</button><button class="btn btn-primary" type="button" data-act="approve" ${holding.length ? 'disabled' : ''}>Approve and request payment</button></div></div>`;
+        <div id="rsSave" style="display:none;gap:8px;padding:12px;border-radius:10px;background:#f4f6fa">
+          <label style="display:flex;gap:8px;align-items:center;font-size:14px"><input type="checkbox" id="rsNotify" ${b.customer && b.customer.email ? 'checked' : 'disabled'}> Email the customer about the new time</label>
+          <div><button class="btn btn-ghost btn-sm" type="button" id="rsBtn">Save new time without approving</button></div>
+          <p class="hint" style="margin:0">Or approve straight away: the new time is used and the approval email mentions the change.</p>
+        </div>
+        <div class="row2"><button class="btn btn-danger" type="button" data-act="reject">Reject</button><button class="btn btn-primary" type="button" data-act="approve">Approve and request payment</button></div></div>`;
     } else if (b.status === 'slip_uploaded') {
       actions = `<div class="actbox">
         <label class="fld"><span>Message to the customer (included in the email)</span><textarea id="note" maxlength="600"></textarea></label>
@@ -362,6 +375,47 @@
       ${b.customer && RESEND_LABEL[b.status] ? `<div class="actbox"><p class="hint" style="margin:0">Customer didn't get it, or it went to spam?</p>
         <div><button class="btn btn-ghost" type="button" id="resend">Resend ${esc(RESEND_LABEL[b.status])} email</button></div></div>` : ''}`;
     d.querySelector('.modal-x').addEventListener('click', closeDrawer);
+    // Changing the date/time of a pending request.
+    if (b.status === 'pending') {
+      const R = (id) => d.querySelector('#' + id);
+      let amountTouched = false, monthCache = {};
+      R('amount').addEventListener('input', () => { amountTouched = true; });
+      const changed = () => R('rsDate').value !== b.date || +R('rsStart').value !== b.start || +R('rsEnd').value !== b.end || +R('rsGuests').value !== b.guests;
+      async function rsCheck() {
+        const date = R('rsDate').value, st = +R('rsStart').value, en = +R('rsEnd').value, msg = R('rsMsg');
+        const h = en - st;
+        R('rsSave').style.display = changed() ? 'grid' : 'none';
+        if (h > 0) {
+          R('rsPrice').textContent = `${h} hours × ${A.fmtMoney(cur, settings.hourly_rate)} = ${A.fmtMoney(cur, h * settings.hourly_rate)}. Change it for discounts or extras.`;
+          if (!amountTouched && changed()) R('amount').value = h * settings.hourly_rate;
+          if (!amountTouched && !changed()) R('amount').value = b.amount;
+        }
+        msg.dataset.tone = '';
+        if (!date) { msg.textContent = 'Pick a date.'; msg.dataset.tone = 'bad'; return; }
+        if (h <= 0) { msg.textContent = 'The end time needs to be after the start.'; msg.dataset.tone = 'bad'; return; }
+        if (!changed()) { msg.textContent = ''; return; }
+        const month = date.slice(0, 7);
+        try { monthCache[month] ||= (await A.api('GET', `/api/availability?month=${month}`)).days; } catch (e) { msg.textContent = e.message; return; }
+        const day = monthCache[month][date] || { booked: [] };
+        const clash = day.booked.filter((r) => st < r[1] && en > r[0]);
+        if (clash.length) { msg.textContent = `Already booked then: ${clash.map((r) => `${A.fmtHour(r[0])}–${A.fmtHour(r[1])}`).join(', ')}. Pick other hours.`; msg.dataset.tone = 'bad'; }
+        else { msg.textContent = `${A.fmtDate(date, { weekday: 'long', month: 'long' })}, ${A.fmtHour(st)}–${A.fmtHour(en)} is free.`; msg.dataset.tone = 'ok'; }
+      }
+      ['rsDate', 'rsStart', 'rsEnd', 'rsGuests'].forEach((id) => R(id).addEventListener('change', rsCheck));
+      R('rsGuests').addEventListener('input', rsCheck);
+      R('rsBtn').addEventListener('click', () => {
+        const err = d.querySelector('.form-err'); err.textContent = '';
+        A.busy(R('rsBtn'), 'Saving…', () => A.api('POST', `/api/admin/bookings/${b.id}/reschedule`, {
+          date: R('rsDate').value, start: +R('rsStart').value, end: +R('rsEnd').value, guests: +R('rsGuests').value,
+          amount: R('amount').value === '' ? undefined : Number(R('amount').value), note: (d.querySelector('#note') || {}).value || '', notify: R('rsNotify').checked,
+        })).then((r) => {
+          const em = r.emailed === 'sent' ? ' Customer emailed.' : r.emailed ? ` Email failed: ${r.emailed}` : '';
+          A.toast(`New time saved.${em}`, r.emailed && r.emailed !== 'sent' ? 'error' : '');
+          openBooking(b.id, onChange); if (onChange) onChange();
+        }).catch((e) => { err.textContent = e.message; });
+      });
+    }
+
     const as = d.querySelector('#adminSlip');
     if (as) as.addEventListener('change', async () => {
       const file = as.files[0]; if (!file) return;
@@ -387,7 +441,10 @@
         btn.dataset.sure = '1'; btn.textContent = act === 'reject' ? 'Click again to reject' : 'Click again to confirm'; return;
       }
       const body = { note };
-      if (act === 'approve') body.amount = d.querySelector('#amount').value === '' ? undefined : Number(d.querySelector('#amount').value);
+      if (act === 'approve') {
+        body.amount = d.querySelector('#amount').value === '' ? undefined : Number(d.querySelector('#amount').value);
+        Object.assign(body, { date: d.querySelector('#rsDate').value, start: +d.querySelector('#rsStart').value, end: +d.querySelector('#rsEnd').value, guests: +d.querySelector('#rsGuests').value });
+      }
       try {
         await A.busy(btn, 'Saving…', () => A.api('POST', `/api/admin/bookings/${b.id}/${act}`, body));
         const msg = { approve: 'Approved. Payment details emailed.', reject: 'Rejected. Customer emailed.', confirm: 'Confirmed. Confirmation emailed.', 'reject-slip': 'Customer asked for a new slip.', cancel: 'Cancelled.' }[act];
@@ -656,7 +713,7 @@
     const m = main();
     m.innerHTML = '<h1>Activity log</h1><p class="sub">The last 200 admin actions, including failed sign-ins.</p><div id="log"><p class="muted">Loading…</p></div>';
     const { entries } = await A.api('GET', '/api/admin/audit');
-    const labels = { login: 'Signed in', login_failed: 'Failed sign-in', approve: 'Approved', reject: 'Rejected', confirm: 'Confirmed payment', 'reject-slip': 'Rejected slip', cancel: 'Cancelled', block: 'Blocked time', settings: 'Changed settings', admin_added: 'Added admin', admin_disabled: 'Disabled admin', admin_updated: 'Updated admin', admin_password_reset: 'Reset admin password', admin_removed: 'Removed admin', master_transferred: 'Handed over master', password_changed: 'Changed own password', setup: 'Setup', resend_email: 'Resent email', test_email: 'Sent test email', manual_booking: 'Added a booking', slip_added: 'Attached a slip' };
+    const labels = { login: 'Signed in', login_failed: 'Failed sign-in', approve: 'Approved', reject: 'Rejected', confirm: 'Confirmed payment', 'reject-slip': 'Rejected slip', cancel: 'Cancelled', block: 'Blocked time', settings: 'Changed settings', admin_added: 'Added admin', admin_disabled: 'Disabled admin', admin_updated: 'Updated admin', admin_password_reset: 'Reset admin password', admin_removed: 'Removed admin', master_transferred: 'Handed over master', password_changed: 'Changed own password', setup: 'Setup', resend_email: 'Resent email', test_email: 'Sent test email', manual_booking: 'Added a booking', slip_added: 'Attached a slip', reschedule: 'Changed the time' };
     document.getElementById('log').innerHTML = entries.length ? `<table class="table" style="display:table"><thead><tr><th>When</th><th>Who</th><th>What</th><th>Details</th><th>IP</th></tr></thead><tbody>
       ${entries.map((e) => `<tr style="cursor:default"><td class="muted">${esc(A.fmtWhen(e.at))}</td><td>${esc(e.username || '–')}</td><td>${esc(labels[e.action] || e.action)}</td><td>${esc(e.detail)}</td><td class="muted">${esc(e.ip)}</td></tr>`).join('')}
       </tbody></table>` : '<div class="panel">No activity yet.</div>';

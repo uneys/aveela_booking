@@ -84,6 +84,7 @@
     const actions = [];
     if (b.hasSlip) actions.push(`<a class="btn btn-ghost btn-sm" href="/api/bookings/${b.id}/slip" target="_blank" rel="noopener">View my slip</a>`);
     if (['pending', 'approved', 'confirmed'].includes(b.status)) actions.push(`<button class="btn btn-ghost btn-sm" type="button" data-resend="${b.id}">Email me this again</button>`);
+    if (b.status === 'pending') actions.push(`<button class="btn btn-ghost btn-sm" type="button" data-change="${b.id}">Change date or time</button>`);
     if (b.status === 'pending' || b.status === 'approved') actions.push(`<button class="btn btn-danger btn-sm" type="button" data-cancel="${b.id}">Cancel request</button>`);
     return `<article class="bk">
       <div class="bk-head"><h3>${esc(b.eventType)} · ${esc(A.fmtDate(b.date, { weekday: 'long', month: 'long' }))}</h3>${A.chip(b.status)}</div>
@@ -136,6 +137,8 @@
         .catch((e) => A.toast(e.message, 'error')));
     }));
 
+    app.querySelectorAll('[data-change]').forEach((btn) => btn.addEventListener('click', () => changeRequest(data.bookings.find((x) => x.id === +btn.dataset.change))));
+
     app.querySelectorAll('[data-resend]').forEach((btn) => btn.addEventListener('click', () =>
       A.busy(btn, 'Sending…', () => A.api('POST', `/api/bookings/${btn.dataset.resend}/resend-email`, {}))
         .then((r) => { A.toast(`Sent to ${r.to}. Check your spam folder if you don't see it.`); btn.textContent = 'Sent'; btn.disabled = true; })
@@ -159,6 +162,43 @@
       const err = pf.querySelector('.form-err'); err.textContent = '';
       try { await A.busy(pf.querySelector('button'), 'Saving…', async () => { A.me = (await A.api('POST', '/api/auth/profile', f)).user; }); A.toast('Details saved.'); }
       catch (ex) { err.textContent = ex.message; }
+    });
+  }
+
+  // Change the date, hours or guests of a request that hasn't been answered yet.
+  function changeRequest(b) {
+    const cfg = A.config;
+    const opts = (from, to, sel) => Array.from({ length: to - from + 1 }, (_, i) => from + i).map((h) => `<option value="${h}" ${h === sel ? 'selected' : ''}>${A.fmtHour(h)}</option>`).join('');
+    const max = new Date(cfg.today + 'T12:00:00Z'); max.setUTCMonth(max.getUTCMonth() + cfg.monthsAhead);
+    const m = A.modal(`<h2 class="dlg-title">Change your request</h2><p class="dlg-intro">Pick a new date or time. The venue hasn't answered yet, so nothing else changes.</p>
+      <form class="form" novalidate>
+        <div class="row2"><label class="fld"><span>Date</span><input name="date" type="date" min="${cfg.today}" max="${max.toISOString().slice(0, 10)}" value="${esc(b.date)}"></label>
+          <label class="fld"><span>Guests</span><input name="guests" type="number" min="1" max="${cfg.maxGuests}" value="${b.guests}"></label></div>
+        <div class="row2"><label class="fld"><span>From</span><select name="start">${opts(cfg.openHour, cfg.closeHour - 1, b.start)}</select></label>
+          <label class="fld"><span>To</span><select name="end">${opts(cfg.openHour + 1, cfg.closeHour, b.end)}</select></label></div>
+        <p class="hint" data-msg aria-live="polite"></p>
+        <p class="form-err" role="alert"></p>
+        <button class="btn btn-gold btn-block" type="submit">Save changes</button></form>`, { label: 'Change request' });
+    const form = m.el.querySelector('form'), msg = m.el.querySelector('[data-msg]'), err = m.el.querySelector('.form-err');
+    const months = {};
+    async function check() {
+      const f = Object.fromEntries(new FormData(form)), st = +f.start, en = +f.end;
+      err.textContent = '';
+      if (!f.date) { msg.textContent = 'Pick a date.'; return; }
+      if (en - st < cfg.minHours) { msg.textContent = `The minimum booking is ${cfg.minHours} hours.`; return; }
+      try { months[f.date.slice(0, 7)] ||= (await A.api('GET', `/api/availability?month=${f.date.slice(0, 7)}`)).days; } catch { msg.textContent = ''; return; }
+      const day = months[f.date.slice(0, 7)][f.date] || { booked: [] };
+      const clash = day.booked.some((r) => st < r[1] && en > r[0]);
+      msg.textContent = clash ? 'Those hours are already booked. Pick another time.' : `Open. About ${A.fmtMoney(cfg.currency, (en - st) * cfg.hourlyRate)} for ${en - st} hours.`;
+    }
+    form.addEventListener('change', check); check();
+    form.addEventListener('submit', async (e) => {
+      e.preventDefault(); err.textContent = '';
+      const f = Object.fromEntries(new FormData(form));
+      try {
+        await A.busy(form.querySelector('button'), 'Saving…', () => A.api('POST', `/api/bookings/${b.id}/change`, { date: f.date, start: +f.start, end: +f.end, guests: +f.guests }));
+        m.close(); A.toast('Request updated. The venue has been told.'); dashboard();
+      } catch (ex) { err.textContent = ex.message; }
     });
   }
 
