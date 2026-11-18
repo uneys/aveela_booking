@@ -15,7 +15,7 @@ export function publicBooking(b) {
     id: b.id, ref: b.ref, eventType: b.event_type, date: b.date, start: b.start_hour, end: b.end_hour,
     guests: b.guests, notes: b.notes, status: b.status, amount: b.amount, vendorNote: b.vendor_note,
     payBy: b.pay_by, hasSlip: !!b.slip_key, slipAt: b.slip_at, createdAt: b.created_at, updatedAt: b.updated_at,
-    source: b.source || 'website',
+    source: b.source || 'website', paymentMethod: b.payment_method || '', paidAt: b.paid_at || null,
   };
 }
 

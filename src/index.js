@@ -38,6 +38,10 @@ async function health(env, url) {
         try { await env.DB.prepare('SELECT suspended, last_login_at FROM users LIMIT 1').all(); checks.databaseVersion = 3; }
         catch { problems.push('The database needs an update for the customer list and account suspension. Paste migrations/0003_customer_suspension.sql into the D1 console and run it once.'); }
       }
+      if (checks.databaseVersion === 3) {
+        try { await env.DB.prepare('SELECT payment_method FROM bookings LIMIT 1').all(); checks.databaseVersion = 4; }
+        catch { problems.push('The database needs an update to record cash payments. Paste migrations/0004_payment_method.sql into the D1 console and run it once.'); }
+      }
     }
   }
   const p = setupProblem(env); if (p) problems.unshift(p);

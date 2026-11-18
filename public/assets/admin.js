@@ -253,7 +253,7 @@
       <td><strong>${esc(A.fmtDate(b.date))}</strong><div class="muted">${A.fmtHour(b.start)}–${A.fmtHour(b.end)}</div></td>
       <td>${esc(b.eventType)}<div class="muted">${esc(b.ref)}</div></td>
       <td>${cust}</td><td>${b.guests || '–'}</td>
-      <td>${b.amount ? esc(A.fmtMoney(settings.currency, b.amount)) : '–'}</td>
+      <td>${b.amount ? esc(A.fmtMoney(settings.currency, b.amount)) : '–'}${b.status === 'confirmed' && PAY_LABEL[b.paymentMethod] ? `<div class="muted">${esc(PAY_LABEL[b.paymentMethod])}</div>` : ''}</td>
       <td>${A.chip(b.status)}</td></tr>`;
   }
   function cardHtml(b) {
@@ -338,7 +338,12 @@
         <div class="row2"><button class="btn btn-danger" type="button" data-act="reject-slip">Slip doesn't match</button><button class="btn btn-primary" type="button" data-act="confirm">Payment received, confirm</button></div></div>`;
     } else if (b.status === 'approved') {
       actions = `<div class="actbox">
-        <p class="hint" style="margin:0">Got the money another way (cash, a transfer you can see, a slip sent on WhatsApp)? Attach the slip if you have one, then confirm.</p>
+        <p class="hint" style="margin:0">Got the money without a slip being uploaded? Choose how they paid, then confirm. If you have a slip or receipt, attach it below.</p>
+        <fieldset class="paym"><legend>How did they pay?</legend>
+          <label><input type="radio" name="pm" value="cash" ${b.hasSlip ? '' : 'checked'}> Cash</label>
+          <label><input type="radio" name="pm" value="bank_transfer" ${b.hasSlip ? 'checked' : ''}> Bank transfer</label>
+          <label><input type="radio" name="pm" value="other"> Other</label>
+        </fieldset>
         <label class="fld"><span>Message to the customer (included in the email)</span><textarea id="note" maxlength="600"></textarea></label>
         <p class="form-err" role="alert"></p>
         <div class="row2"><button class="btn btn-danger" type="button" data-act="cancel">Cancel booking</button><button class="btn btn-primary" type="button" data-act="confirm">Payment received, confirm</button></div></div>`;
@@ -365,6 +370,7 @@
         ${b.source && b.source !== 'website' ? `<dt>Came in via</dt><dd>${esc(b.source)}${b.createdBy ? `, added by ${esc(b.createdBy)}` : ''}</dd>` : ''}
         ${b.notes ? `<dt>${b.status === 'blocked' ? 'Reason' : 'Their notes'}</dt><dd>${esc(b.notes)}</dd>` : ''}
         ${b.vendorNote ? `<dt>Your note</dt><dd>${esc(b.vendorNote)}</dd>` : ''}
+        ${b.status === 'confirmed' && PAY_LABEL[b.paymentMethod] ? `<dt>Paid by</dt><dd>${esc(PAY_LABEL[b.paymentMethod])}${b.paidAt ? `, marked ${esc(A.fmtWhen(b.paidAt))}` : ''}</dd>` : ''}
         ${b.payBy && b.status === 'approved' ? `<dt>Pay by</dt><dd>${esc(A.fmtWhen(b.payBy))}</dd>` : ''}
         <dt>Requested</dt><dd>${esc(A.fmtWhen(b.createdAt))}</dd>
         ${b.decidedBy ? `<dt>Handled by</dt><dd>${esc(b.decidedBy)}</dd>` : ''}
@@ -446,18 +452,23 @@
         btn.dataset.sure = '1'; btn.textContent = act === 'reject' ? 'Click again to reject' : 'Click again to confirm'; return;
       }
       const body = { note };
+      if (act === 'confirm') {
+        const pm = d.querySelector('input[name=pm]:checked');
+        if (pm) body.paymentMethod = pm.value;
+      }
       if (act === 'approve') {
         body.amount = d.querySelector('#amount').value === '' ? undefined : Number(d.querySelector('#amount').value);
         Object.assign(body, { date: d.querySelector('#rsDate').value, start: +d.querySelector('#rsStart').value, end: +d.querySelector('#rsEnd').value, guests: +d.querySelector('#rsGuests').value });
       }
       try {
         await A.busy(btn, 'Saving…', () => A.api('POST', `/api/admin/bookings/${b.id}/${act}`, body));
-        const msg = { approve: 'Approved. Payment details emailed.', reject: 'Rejected. Customer emailed.', confirm: 'Confirmed. Confirmation emailed.', 'reject-slip': 'Customer asked for a new slip.', cancel: 'Cancelled.' }[act];
+        const msg = { approve: 'Approved. Payment details emailed.', reject: 'Rejected. Customer emailed.', confirm: body.paymentMethod === 'cash' ? 'Confirmed as paid in cash. Confirmation emailed.' : 'Confirmed. Confirmation emailed.', 'reject-slip': 'Customer asked for a new slip.', cancel: 'Cancelled.' }[act];
         A.toast(msg); closeDrawer(); refreshCounts(); if (onChange) onChange();
       } catch (ex) { err.textContent = ex.message; }
     }));
   }
 
+  const PAY_LABEL = { cash: 'Cash', bank_transfer: 'Bank transfer', other: 'Other' };
   const RESEND_LABEL = { pending: 'request received', approved: 'payment details', confirmed: 'confirmation', rejected: 'declined', cancelled: 'cancellation' };
 
   // ---------- customers ----------
@@ -605,6 +616,8 @@
               <option value="confirmed">Confirmed, already paid</option>
               <option value="pending">Pending, decide later</option></select></label>
             <label class="fld"><span>Amount (${esc(s.currency)})</span><input name="amount" type="number" min="0" step="1"></label>
+            <label class="fld" id="nbPayWrap" style="display:none"><span>How did they pay?</span><select name="paymentMethod">
+              <option value="cash">Cash</option><option value="bank_transfer">Bank transfer</option><option value="other">Other</option></select></label>
           </div>
           <p class="hint" id="nbPrice" style="margin-top:8px"></p>
           <label class="fld" style="margin-top:10px"><span>Message to the customer (optional, included in the email)</span><textarea name="note" maxlength="600"></textarea></label>
@@ -662,6 +675,8 @@
     ['date', 'start', 'end'].forEach((n) => F(n).addEventListener('change', check));
     F('email').addEventListener('input', notifyState);
     F('status').addEventListener('change', notifyState);
+    const payState = () => { document.getElementById('nbPayWrap').style.display = F('status').value === 'confirmed' ? '' : 'none'; };
+    F('status').addEventListener('change', payState); payState();
     price(); notifyState();
 
     formSubmit(form, 'Saving…', async (v) => {
@@ -669,12 +684,13 @@
       if (!v.phone && !v.email) throw new Error('Enter a phone number or an email, so you can reach the customer.');
       if (!v.date) throw new Error('Pick a date.');
       const body = { ...v, start: Number(v.start), end: Number(v.end), guests: Number(v.guests), notify: !F('notify').disabled && F('notify').checked };
+      if (v.status !== 'confirmed') delete body.paymentMethod;
       const r = await A.api('POST', '/api/admin/bookings', body);
       const emailed = r.emailed === 'sent' ? ' Email sent.' : r.emailed ? ` The email couldn't be sent: ${r.emailed}` : '';
       A.toast(`Saved ${r.booking.ref}.${emailed}`, r.emailed && r.emailed !== 'sent' ? 'error' : '');
       refreshCounts();
       openBooking(r.booking.id);
-      form.reset(); amountTouched = false; lastMonth = ''; price(); notifyState(); check();
+      form.reset(); amountTouched = false; lastMonth = ''; price(); notifyState(); payState(); check();
     });
   }
 

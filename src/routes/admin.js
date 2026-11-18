@@ -4,7 +4,7 @@ import { hashPassword, verifyPassword, dummyVerify, validPrehash, timingSafeEqua
 import {
   now, getSettings, SETTING_DEFAULTS, NUMERIC_SETTINGS, createSession, readSession, destroySession, destroyAllSessions,
   hit, peek, clearHits, audit, expireUnpaid, findClashes, newRef, isDate, sessionEndReason, venueToday, describeSlot,
-  gapHours, FREE_GUARD, guardArgs,
+  gapHours, FREE_GUARD, guardArgs, PAYMENT_METHODS,
 } from '../lib/core.js';
 import { publicBooking, serveSlip, readSlipUpload, storeSlip, EVENT_TYPES, SOURCES } from './bookings.js';
 import { mail, statusEmail, emailProvider } from '../lib/email.js';
@@ -237,6 +237,8 @@ export async function handleAdmin(request, env, ctx, url, path) {
     if (!Number.isInteger(start) || !Number.isInteger(end) || start < 0 || end > 24 || end <= start) throw bad('Pick a start and end time, ending after it starts.');
     if (!Number.isInteger(guests) || guests < 1 || guests > 10000) throw bad('Enter the number of guests.');
     if (!status) throw bad('Pick a status.');
+    const paymentMethod = status === 'confirmed' ? (body.paymentMethod || 'cash') : '';
+    if (status === 'confirmed' && !PAYMENT_METHODS[paymentMethod]) throw bad('Choose how the customer paid.');
     const amount = body.amount === undefined || body.amount === '' ? (end - start) * s.hourly_rate : Number(body.amount);
     if (!Number.isInteger(amount) || amount < 0 || amount > 100000000) throw bad('Enter the amount as a whole number.');
     if (status !== 'pending') {
@@ -260,6 +262,10 @@ export async function handleAdmin(request, env, ctx, url, path) {
       .bind(newRef(), userId, eventType, date, start, end, guests, notes, status, amount, noteOf(body), payBy,
         status === 'pending' ? null : a.id, a.id, source, name, email, phone, t, t, status, ...guardArgs(0, date, start, end, g)).first();
     if (!b) throw conflict('Those hours were just taken by another booking. Pick other hours.', 'taken');
+    if (paymentMethod) {
+      try { await env.DB.prepare('UPDATE bookings SET payment_method = ?, paid_at = ? WHERE id = ?').bind(paymentMethod, t, b.id).run(); b.payment_method = paymentMethod; }
+      catch (e) { if (!/no such column|has no column named/i.test(String(e && e.message))) throw e; }
+    }
     let emailed = null;
     if (email && body.notify) {
       const send = status === 'pending' ? mail.requested : status === 'approved' ? mail.approved : mail.confirmed;
@@ -373,8 +379,18 @@ export async function handleAdmin(request, env, ctx, url, path) {
     } else if (action === 'confirm') {
       // From "slip uploaded", or straight from "approved" when the money came another way (cash, transfer seen in the bank app).
       if (!['slip_uploaded', 'approved'].includes(b.status)) throw conflict('Only approved bookings can be confirmed.');
-      updated = await env.DB.prepare("UPDATE bookings SET status = 'confirmed', vendor_note = ?, decided_by = ?, updated_at = ? WHERE id = ? AND status IN ('slip_uploaded','approved') RETURNING *")
-        .bind(note || b.vendor_note, a.id, t, id).first();
+      // How they paid: a slip means bank transfer; without one, staff choose (cash, transfer seen in the bank app, other).
+      const method = body.paymentMethod || (b.slip_key ? 'bank_transfer' : '');
+      if (!PAYMENT_METHODS[method]) throw bad('Choose how the customer paid.');
+      try {
+        updated = await env.DB.prepare("UPDATE bookings SET status = 'confirmed', vendor_note = ?, payment_method = ?, paid_at = ?, decided_by = ?, updated_at = ? WHERE id = ? AND status IN ('slip_uploaded','approved') RETURNING *")
+          .bind(note || b.vendor_note, method, t, a.id, t, id).first();
+      } catch (e) {
+        if (!/no such column|has no column named/i.test(String(e && e.message))) throw e;
+        // Database not updated to migration 0004 yet: confirm anyway, without recording the method.
+        updated = await env.DB.prepare("UPDATE bookings SET status = 'confirmed', vendor_note = ?, decided_by = ?, updated_at = ? WHERE id = ? AND status IN ('slip_uploaded','approved') RETURNING *")
+          .bind(note || b.vendor_note, a.id, t, id).first();
+      }
       if (!updated) throw conflict('This booking changed in the meantime. Reload and try again.');
       if (email) ctx.waitUntil(mail.confirmed(env, s, email, updated));
     } else if (action === 'reject-slip') {
@@ -392,7 +408,7 @@ export async function handleAdmin(request, env, ctx, url, path) {
         .bind(note, a.id, t, id).first();
       if (email && b.status !== 'blocked') ctx.waitUntil(mail.cancelledByVenue(env, s, email, updated));
     }
-    await audit(env, a.id, action, `${b.ref}${note ? ': ' + note : ''}`, ip);
+    await audit(env, a.id, action, `${b.ref}${action === 'confirm' && updated && PAYMENT_METHODS[updated.payment_method] ? ` (paid by ${PAYMENT_METHODS[updated.payment_method].toLowerCase()})` : ''}${note ? ': ' + note : ''}`, ip);
     return json({ booking: adminBooking(await loadBooking(env, id)) });
   }
 

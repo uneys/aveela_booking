@@ -3,7 +3,7 @@
 //   2. Resend: set RESEND_API_KEY (needs your own domain)
 // With neither, emails are written to the logs instead of sent, so local testing still works.
 // Set EMAIL_PROVIDER=gmail or EMAIL_PROVIDER=resend to force one when both are configured.
-import { fmtDate, fmtHour, money } from './core.js';
+import { fmtDate, fmtHour, money, PAYMENT_METHODS } from './core.js';
 import { buildMime, smtpSend } from './smtp.js';
 
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
@@ -81,13 +81,15 @@ function bookingTable(s, b) {
     ['Guests', String(b.guests)],
   ];
   if (b.amount) rows.push(['Amount', money(s, b.amount)]);
+  if (b.status === 'confirmed' && PAYMENT_METHODS[b.payment_method]) rows.push(['Paid by', PAYMENT_METHODS[b.payment_method]]);
   return `<table role="presentation" cellpadding="0" cellspacing="0" style="width:100%;border-collapse:collapse;margin:6px 0 18px;font-size:14px">${rows
     .map(([k, v]) => `<tr><td style="padding:8px 0;border-top:1px solid #eee;color:#6b7280;width:38%">${esc(k)}</td><td style="padding:8px 0;border-top:1px solid #eee">${esc(v)}</td></tr>`)
     .join('')}</table>`;
 }
 
 function bookingText(s, b) {
-  return `Reference: ${b.ref}\nEvent: ${b.event_type}\nDate: ${fmtDate(b.date)}\nTime: ${fmtHour(b.start_hour)} to ${fmtHour(b.end_hour)}\nGuests: ${b.guests}${b.amount ? `\nAmount: ${money(s, b.amount)}` : ''}`;
+  const paid = b.status === 'confirmed' && PAYMENT_METHODS[b.payment_method] ? `\nPaid by: ${PAYMENT_METHODS[b.payment_method]}` : '';
+  return `Reference: ${b.ref}\nEvent: ${b.event_type}\nDate: ${fmtDate(b.date)}\nTime: ${fmtHour(b.start_hour)} to ${fmtHour(b.end_hour)}\nGuests: ${b.guests}${b.amount ? `\nAmount: ${money(s, b.amount)}` : ''}${paid}`;
 }
 
 // Which email goes with a booking's current status (used by the "resend email" buttons).
@@ -176,8 +178,8 @@ export const mail = {
   confirmed(env, s, to, b) {
     return sendEmail(env, {
       to, subject: `Confirmed: ${b.ref} on ${fmtDate(b.date)}`,
-      html: layout(env, 'Your booking is confirmed', p("Payment received. Your date is confirmed and the venue is yours for these hours. We can't wait to host you!") + bookingTable(s, b) + (b.vendor_note ? p(`Note from us: ${esc(b.vendor_note)}`) : '') + p('Keep this email as your booking confirmation.')),
-      text: `Payment received. Your booking is confirmed.\n\n${bookingText(s, b)}${b.vendor_note ? '\n\nNote from us: ' + b.vendor_note : ''}\n\nKeep this email as your confirmation.`,
+      html: layout(env, 'Your booking is confirmed', p(`Payment received${b.payment_method === 'cash' ? ' in cash' : ''}. Your date is confirmed and the venue is yours for these hours. We can't wait to host you!`) + bookingTable(s, b) + (b.vendor_note ? p(`Note from us: ${esc(b.vendor_note)}`) : '') + p('Keep this email as your booking confirmation.')),
+      text: `Payment received${b.payment_method === 'cash' ? ' in cash' : ''}. Your booking is confirmed.\n\n${bookingText(s, b)}${b.vendor_note ? '\n\nNote from us: ' + b.vendor_note : ''}\n\nKeep this email as your confirmation.`,
     });
   },
   cancelledByVenue(env, s, to, b) {

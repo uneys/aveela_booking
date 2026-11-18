@@ -163,6 +163,9 @@ export function fmtDate(d) {
   return new Date(d + 'T12:00:00Z').toLocaleDateString('en-GB', { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric', timeZone: 'UTC' });
 }
 
+// How a booking was paid. Stored in bookings.payment_method.
+export const PAYMENT_METHODS = { bank_transfer: 'Bank transfer', cash: 'Cash', other: 'Other' };
+
 export function describeSlot(b) {
   return `${fmtDate(b.date)}, ${fmtHour(b.start_hour)} to ${fmtHour(b.end_hour)}`;
 }

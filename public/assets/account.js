@@ -55,6 +55,8 @@
     });
   }
 
+  const PAID = { cash: 'Paid in cash', bank_transfer: 'Paid by bank transfer', other: 'Paid' };
+
   function statusLine(b) {
     switch (b.status) {
       case 'pending': return 'The venue is reviewing your request. You’ll get an email when they reply.';
@@ -88,7 +90,7 @@
     if (b.status === 'pending' || b.status === 'approved') actions.push(`<button class="btn btn-danger btn-sm" type="button" data-cancel="${b.id}">Cancel request</button>`);
     return `<article class="bk">
       <div class="bk-head"><h3>${esc(b.eventType)} · ${esc(A.fmtDate(b.date, { weekday: 'long', month: 'long' }))}</h3>${A.chip(b.status)}</div>
-      <p class="bk-meta"><span>${A.fmtHour(b.start)} to ${A.fmtHour(b.end)} (${hrs} h)</span><span>${b.guests} guests</span>${b.amount ? `<span>${esc(A.fmtMoney(cfg.currency, b.amount))}</span>` : ''}</p>
+      <p class="bk-meta"><span>${A.fmtHour(b.start)} to ${A.fmtHour(b.end)} (${hrs} h)</span><span>${b.guests} guests</span>${b.amount ? `<span>${esc(A.fmtMoney(cfg.currency, b.amount))}</span>` : ''}${b.status === 'confirmed' && PAID[b.paymentMethod] ? `<span>${PAID[b.paymentMethod]}</span>` : ''}</p>
       <p class="bk-ref">Ref ${esc(b.ref)}</p>
       <p style="margin:10px 0 0;font-size:15px">${esc(statusLine(b))}</p>
       ${b.vendorNote ? `<p class="bk-note">From the venue: ${esc(b.vendorNote)}</p>` : ''}
