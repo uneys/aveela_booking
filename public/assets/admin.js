@@ -356,7 +356,8 @@
     }
     if (['approved', 'slip_uploaded', 'confirmed'].includes(b.status)) {
       actions += `<div class="actbox"><label class="btn btn-ghost file-pick" style="justify-self:start">${b.hasSlip ? 'Replace slip or receipt' : 'Attach slip or receipt'}
-        <input type="file" id="adminSlip" accept="image/jpeg,image/png,image/webp,application/pdf"></label></div>`;
+        <input type="file" id="adminSlip" accept="image/*,application/pdf"></label>
+        <p class="hint" style="margin:0">Photos are made smaller automatically (max 500 KB). PDFs must be under 500 KB.</p></div>`;
     }
     d.innerHTML = `<button class="modal-x" type="button" aria-label="Close">×</button>
       <h2>${esc(b.eventType)}</h2>${A.chip(b.status)}
@@ -431,10 +432,13 @@
     const as = d.querySelector('#adminSlip');
     if (as) as.addEventListener('change', async () => {
       const file = as.files[0]; if (!file) return;
-      if (file.size > 5 * 1024 * 1024) { A.toast('That file is larger than 5 MB.', 'error'); as.value = ''; return; }
-      const fd = new FormData(); fd.append('slip', file);
-      as.parentElement.firstChild.textContent = 'Uploading…';
-      try { await A.api('POST', `/api/admin/bookings/${b.id}/slip`, fd); A.toast('Slip attached.'); refreshCounts(); openBooking(b.id, onChange); if (onChange) onChange(); }
+      as.parentElement.firstChild.textContent = 'Preparing…';
+      try {
+        const slip = await A.prepareSlip(file);
+        const fd = new FormData(); fd.append('slip', slip.blob, slip.name);
+        as.parentElement.firstChild.textContent = 'Uploading…';
+        await A.api('POST', `/api/admin/bookings/${b.id}/slip`, fd);
+        A.toast(`Slip attached (${Math.round(slip.after / 1024)} KB).`); refreshCounts(); openBooking(b.id, onChange); if (onChange) onChange(); }
       catch (e) { A.toast(e.message, 'error'); openBooking(b.id, onChange); }
     });
     const rs = d.querySelector('#resend');

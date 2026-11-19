@@ -30,6 +30,58 @@
     return btoa(s);
   };
 
+  // ---------- bank slip compression (runs in the browser, so the server does no image work) ----------
+  // Photos are resized to at most 1600 px on the long side, re-encoded as WebP (or JPEG where WebP
+  // isn't supported) and stepped down in quality until they fit in 500 KB. Re-encoding also removes
+  // hidden photo data such as GPS location. PDFs can't be shrunk here, so they must already be ≤ 500 KB.
+  A.SLIP_MAX = 500 * 1024;
+  const SLIP_DIM = 1600;
+
+  async function decodeImage(file) {
+    if (window.createImageBitmap) {
+      try { return await createImageBitmap(file, { imageOrientation: 'from-image' }); } catch {}
+    }
+    return new Promise((resolve, reject) => {
+      const url = URL.createObjectURL(file), img = new Image();
+      img.onload = () => { URL.revokeObjectURL(url); resolve(img); };
+      img.onerror = () => { URL.revokeObjectURL(url); reject(new Error("This photo couldn't be opened. Try a screenshot of the slip instead.")); };
+      img.src = url;
+    });
+  }
+
+  const toBlob = (canvas, type, q) => new Promise((r) => canvas.toBlob(r, type, q));
+
+  A.prepareSlip = async function (file) {
+    if (!file) throw new Error('Choose a file to upload.');
+    const isPdf = file.type === 'application/pdf' || /\.pdf$/i.test(file.name);
+    if (isPdf) {
+      if (file.size > A.SLIP_MAX) throw new Error(`That PDF is ${Math.round(file.size / 1024)} KB. The limit is 500 KB, so upload a screenshot or photo of the slip instead. Photos are shrunk automatically.`);
+      return { blob: file, name: 'slip.pdf', before: file.size, after: file.size };
+    }
+    if (!/^image\//.test(file.type) && !/\.(jpe?g|png|webp|heic|heif|gif|bmp)$/i.test(file.name)) throw new Error('Upload a photo, a screenshot or a PDF of the slip.');
+    const img = await decodeImage(file);
+    let scale = Math.min(1, SLIP_DIM / Math.max(img.width, img.height));
+    const canvas = document.createElement('canvas');
+    const ctx = canvas.getContext('2d');
+    for (let attempt = 0; attempt < 6; attempt++) {
+      canvas.width = Math.max(1, Math.round(img.width * scale));
+      canvas.height = Math.max(1, Math.round(img.height * scale));
+      ctx.fillStyle = '#fff'; // transparent screenshots get a white background
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+      ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+      for (const q of [0.82, 0.72, 0.62, 0.52]) {
+        let blob = await toBlob(canvas, 'image/webp', q);
+        if (!blob || blob.type !== 'image/webp') blob = await toBlob(canvas, 'image/jpeg', q); // older Safari
+        if (blob && blob.size <= A.SLIP_MAX) {
+          if (img.close) img.close();
+          return { blob, name: blob.type === 'image/webp' ? 'slip.webp' : 'slip.jpg', before: file.size, after: blob.size };
+        }
+      }
+      scale *= 0.75; // still too big: make it smaller and try again
+    }
+    throw new Error("This photo couldn't be made small enough. Try a closer screenshot of just the slip.");
+  };
+
   A.fmtHour = (h) => (h === 0 || h === 24 ? '12am' : h === 12 ? '12pm' : h < 12 ? `${h}am` : `${h - 12}pm`);
   A.fmtDate = (d, opts) => new Date(d + 'T12:00:00Z').toLocaleDateString(undefined, { weekday: 'short', day: 'numeric', month: 'short', year: 'numeric', timeZone: 'UTC', ...opts });
   A.fmtMoney = (cur, n) => `${cur} ${Number(n || 0).toLocaleString('en-US')}`;

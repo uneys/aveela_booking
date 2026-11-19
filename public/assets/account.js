@@ -80,8 +80,8 @@
       pay = `<div class="pay"><h4>Payment</h4><dl>${rows.map((r) => `<dt>${esc(r[0])}</dt><dd>${esc(r[1])}</dd>`).join('')}</dl>
         ${payment.note ? `<p class="hint" style="margin:0 0 12px">${esc(payment.note)}</p>` : ''}
         ${b.payBy ? `<p class="hint" style="margin:0 0 12px">Upload the slip by ${esc(A.fmtWhen(b.payBy))}, or the hours are released.</p>` : ''}
-        <label class="btn btn-gold file-pick">Upload bank slip<input type="file" accept="image/jpeg,image/png,image/webp,application/pdf" data-slip="${b.id}"></label>
-        <p class="hint" style="margin:8px 0 0">JPG, PNG, WebP or PDF, up to 5 MB.</p></div>`;
+        <label class="btn btn-gold file-pick">Upload bank slip<input type="file" accept="image/*,application/pdf" data-slip="${b.id}"></label>
+        <p class="hint" style="margin:8px 0 0">A photo or screenshot of the slip works best. It's made smaller automatically. PDFs up to 500 KB.</p></div>`;
     }
     const actions = [];
     if (b.hasSlip) actions.push(`<a class="btn btn-ghost btn-sm" href="/api/bookings/${b.id}/slip" target="_blank" rel="noopener">View my slip</a>`);
@@ -149,11 +149,15 @@
     app.querySelectorAll('[data-slip]').forEach((input) => input.addEventListener('change', async () => {
       const file = input.files[0];
       if (!file) return;
-      if (file.size > 5 * 1024 * 1024) { A.toast('That file is larger than 5 MB.', 'error'); input.value = ''; return; }
       const label = input.parentElement;
-      const fd = new FormData(); fd.append('slip', file);
-      label.firstChild.textContent = 'Uploading…';
-      try { await A.api('POST', `/api/bookings/${input.dataset.slip}/slip`, fd); A.toast('Slip uploaded. We’ll email you once the payment is checked.'); dashboard(); }
+      label.firstChild.textContent = 'Preparing…';
+      try {
+        const slip = await A.prepareSlip(file);
+        const fd = new FormData(); fd.append('slip', slip.blob, slip.name);
+        label.firstChild.textContent = 'Uploading…';
+        await A.api('POST', `/api/bookings/${input.dataset.slip}/slip`, fd);
+        A.toast('Slip uploaded. We’ll email you once the payment is checked.'); dashboard();
+      }
       catch (e) { A.toast(e.message, 'error'); label.firstChild.textContent = 'Upload bank slip'; input.value = ''; }
     }));
 

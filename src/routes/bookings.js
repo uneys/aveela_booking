@@ -7,7 +7,8 @@ import { mail, statusEmail } from '../lib/email.js';
 export const EVENT_TYPES = ['Wedding', 'Engagement', 'Birthday', 'Baby shower', 'Party', 'Corporate', 'Workshop', 'Other'];
 // Where a booking request came from. 'website' is set automatically; the rest are for manual bookings.
 export const SOURCES = ['Phone call', 'WhatsApp', 'Viber', 'Instagram', 'Facebook', 'Email', 'Walk-in', 'Other'];
-const MAX_SLIP = 5 * 1024 * 1024;
+// Bank slips are shrunk in the browser before upload; the server only enforces the limit (no image work here).
+const MAX_SLIP = 500 * 1024;
 const MONTHS_AHEAD = 18;
 
 export function publicBooking(b) {
@@ -31,11 +32,11 @@ function sniffSlip(bytes) {
 // Reads and checks an uploaded slip from a multipart form field named "slip".
 export async function readSlipUpload(request) {
   const len = Number(request.headers.get('content-length') || 0);
-  if (len > MAX_SLIP + 20000) throw bad('The file is larger than 5 MB.');
+  if (len > MAX_SLIP + 20000) throw bad('The file is larger than 500 KB. Upload a photo or screenshot of the slip instead. Those are made smaller automatically.');
   const form = await request.formData();
   const file = form.get('slip');
   if (!file || typeof file === 'string') throw bad('Choose a file to upload.');
-  if (file.size > MAX_SLIP) throw bad('The file is larger than 5 MB.');
+  if (file.size > MAX_SLIP) throw bad('The file is larger than 500 KB. Upload a photo or screenshot of the slip instead. Those are made smaller automatically.');
   const bytes = new Uint8Array(await file.arrayBuffer());
   const type = sniffSlip(bytes);
   if (!type) throw bad('Upload a JPG, PNG, WebP or PDF.');
