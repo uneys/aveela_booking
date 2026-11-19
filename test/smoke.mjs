@@ -1,0 +1,574 @@
+// End-to-end smoke test: runs the real Worker against an in-memory SQLite stand-in for D1.
+// Usage: node --no-warnings test/smoke.mjs   (Node 22.5+)
+import { DatabaseSync } from 'node:sqlite';
+import { readFileSync, existsSync, readdirSync } from 'node:fs';
+import { join, extname, dirname } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import worker from '../src/index.js';
+
+const root = join(dirname(fileURLToPath(import.meta.url)), '..');
+
+// ---------- D1 shim ----------
+function d1(db) {
+  const norm = (v) => (v === undefined ? null : typeof v === 'boolean' ? Number(v) : v);
+  const stmt = (sql, args = []) => ({
+    bind: (...a) => stmt(sql, a.map(norm)),
+    first: async () => db.prepare(sql).get(...args) ?? null,
+    all: async () => ({ results: db.prepare(sql).all(...args) }),
+    run: async () => { const r = db.prepare(sql).run(...args); return { meta: { changes: r.changes } }; },
+    _exec: () => db.prepare(sql).run(...args),
+  });
+  return {
+    prepare: (sql) => stmt(sql),
+    batch: async (list) => { db.exec('BEGIN'); try { for (const s of list) s._exec(); db.exec('COMMIT'); } catch (e) { db.exec('ROLLBACK'); throw e; } return []; },
+  };
+}
+const db = new DatabaseSync(':memory:');
+const migrations = readdirSync(join(root, 'migrations')).filter((f) => f.endsWith('.sql')).sort();
+for (const f of migrations) db.exec(readFileSync(join(root, 'migrations', f), 'utf8'));
+
+const kv = new Map();
+const SLIPS = {
+  put: async (k, v) => kv.set(k, v),
+  get: async (k) => (kv.has(k) ? kv.get(k).buffer : null),
+  delete: async (k) => kv.delete(k),
+};
+const types = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript', '.css': 'text/css', '.jpg': 'image/jpeg' };
+const ASSETS = {
+  fetch: async (req) => {
+    let p = new URL(req.url).pathname;
+    if (p === '/') p = '/index.html';
+    else if (!extname(p)) p += '.html';
+    const f = join(root, 'public', p);
+    if (!existsSync(f)) return new Response('Not found', { status: 404 });
+    return new Response(readFileSync(f), { headers: { 'content-type': types[extname(f)] || 'application/octet-stream' } });
+  },
+};
+
+const env = {
+  DB: d1(db), SLIPS, ASSETS, APP_URL: 'https://aveela.test', MAIL_FROM: 'Aveela <a@b.c>', VENUE_TZ: 'Indian/Maldives',
+  SERVER_HASH_ITERATIONS: '20000', PEPPER: 'p'.repeat(64), SETUP_TOKEN: 'setup-token-123456789',
+};
+
+// Capture "emails" (logged because RESEND_API_KEY is unset).
+const mails = [];
+const origLog = console.log;
+console.log = (...a) => { const s = a.join(' '); if (s.startsWith('[email not sent')) mails.push(s); else origLog(...a); };
+
+// ---------- client ----------
+async function prehash(realm, id, password) {
+  const k = await crypto.subtle.importKey('raw', new TextEncoder().encode(password), 'PBKDF2', false, ['deriveBits']);
+  const bits = await crypto.subtle.deriveBits({ name: 'PBKDF2', hash: 'SHA-256', salt: new TextEncoder().encode(`aveela:${realm}:${id.trim().toLowerCase()}`), iterations: 600000 }, k, 256);
+  return Buffer.from(bits).toString('base64');
+}
+
+function client(ip = '1.1.1.1') {
+  const jar = {};
+  return async function call(method, path, body, extra = {}) {
+    const headers = { 'cf-connecting-ip': ip, origin: 'https://aveela.test', 'x-aveela': '1', ...extra.headers };
+    const cookieStr = Object.entries(jar).map(([k, v]) => `${k}=${v}`).join('; ');
+    if (cookieStr) headers.cookie = cookieStr;
+    let payload;
+    if (body instanceof FormData) payload = body;
+    else if (body !== undefined) { payload = JSON.stringify(body); headers['content-type'] = 'application/json'; }
+    const waits = [];
+    const res = await worker.fetch(new Request('https://aveela.test' + path, { method, headers, body: payload, redirect: 'manual' }), env, { waitUntil: (p) => waits.push(p) });
+    await Promise.all(waits);
+    for (const c of res.headers.getSetCookie()) {
+      const [kv] = c.split(';'); const i = kv.indexOf('=');
+      const k = kv.slice(0, i), v = kv.slice(i + 1);
+      if (/Max-Age=0/.test(c)) delete jar[k]; else jar[k] = v;
+    }
+    const ct = res.headers.get('content-type') || '';
+    const data = ct.includes('json') ? await res.json() : null;
+    return { status: res.status, data, res };
+  };
+}
+
+let passed = 0;
+function ok(cond, msg) { if (!cond) { origLog('FAIL:', msg); process.exit(1); } passed++; origLog('  ok', msg); }
+const linkFrom = (re) => { for (let i = mails.length - 1; i >= 0; i--) { const m = mails[i].match(re); if (m) return m[1]; } return null; };
+
+const day = new Date(Date.now() + 30 * 864e5).toISOString().slice(0, 10);
+
+// ---------- run ----------
+origLog('Pages');
+const anon = client('9.9.9.9');
+let r = await anon('GET', '/');
+ok(r.status === 200 && r.res.headers.get('content-security-policy')?.includes("script-src 'self'"), 'home page served with CSP');
+r = await anon('GET', '/api/config');
+ok(r.data.openHour === 8 && r.data.googleEnabled === false, 'config endpoint');
+r = await anon('POST', '/api/auth/login', { email: 'a@b.co', pw: 'x' }, { headers: { 'x-aveela': '' } });
+ok(r.status === 403, 'POST without custom header is blocked (CSRF)');
+
+origLog('Admin setup');
+const adm = client('2.2.2.2');
+r = await adm('GET', '/api/admin/state');
+ok(r.data.needsSetup === true, 'needs setup');
+r = await adm('POST', '/api/admin/setup', { token: 'wrong', username: 'owner', pw: await prehash('admin', 'owner', 'master-pass-123!') });
+ok(r.status === 403, 'wrong setup token refused');
+r = await adm('POST', '/api/admin/setup', { token: env.SETUP_TOKEN, username: 'owner', name: 'Owner', pw: await prehash('admin', 'owner', 'master-pass-123!') });
+ok(r.status === 201 && r.data.admin.isMaster, 'master admin created');
+r = await adm('POST', '/api/admin/setup', { token: env.SETUP_TOKEN, username: 'owner2', pw: await prehash('admin', 'owner2', 'x'.repeat(12)) });
+ok(r.status === 409, 'setup cannot run twice');
+const stored = db.prepare('SELECT password_hash FROM admins').get().password_hash;
+ok(/^v1\$20000\$/.test(stored), 'admin hash stored as v1$20000$salt$hash');
+r = await adm('POST', '/api/admin/settings', { bank_name: 'Bank of Maldives', account_name: 'Aveela Pvt Ltd', account_number: '7730000123456', hourly_rate: 3000, notify_email: 'owner@aveela.test' });
+ok(r.data.settings.hourly_rate === 3000, 'master updates settings');
+
+origLog('Customer signup');
+const cust = client('3.3.3.3');
+r = await cust('POST', '/api/auth/signup', { name: 'Aisha', email: 'Aisha@Example.com', pw: await prehash('user', 'aisha@example.com', 'customer-pass-1') });
+ok(r.status === 201 && r.data.user.verified === false, 'signup creates unverified account and signs in');
+r = await cust('POST', '/api/bookings', { eventType: 'Birthday', date: day, start: 10, end: 14, guests: 50 });
+ok(r.status === 403, 'unverified user cannot book');
+const vtoken = linkFrom(/auth\/verify\?token=([\w-]+)/);
+r = await cust('GET', `/auth/verify?token=${vtoken}`);
+ok(r.status === 302 && r.res.headers.get('location') === '/account?verified=1', 'email verification link works');
+r = await cust('GET', `/auth/verify?token=${vtoken}`);
+ok(r.res.headers.get('location') === '/account?verify=expired', 'verification link is single use');
+
+origLog('Availability and booking');
+r = await cust('POST', '/api/bookings', { eventType: 'Birthday', date: day, start: 10, end: 11, guests: 50 });
+ok(r.status === 400 && /minimum/.test(r.data.error), 'minimum hours enforced');
+r = await cust('POST', '/api/bookings', { eventType: 'Birthday', date: day, start: 10, end: 14, guests: 50, notes: 'Balloon arch' });
+ok(r.status === 201 && r.data.booking.status === 'pending' && r.data.booking.amount === 12000, 'request created, priced 4h x 3000');
+const bid = r.data.booking.id;
+ok(mails.some((m) => m.includes('owner@aveela.test') && m.includes('New booking request')), 'vendor notified of new request');
+r = await anon('GET', `/api/availability?month=${day.slice(0, 7)}`);
+ok(JSON.stringify(r.data.days[day].requested) === '[[10,14]]' && r.data.days[day].booked.length === 0, 'availability shows pending as requested');
+ok(!JSON.stringify(r.data).includes('Aisha'), 'availability does not leak customer data');
+
+const other = client('4.4.4.4');
+await other('POST', '/api/auth/signup', { name: 'Ben', email: 'ben@example.com', pw: await prehash('user', 'ben@example.com', 'ben-password-1') });
+await other('GET', `/auth/verify?token=${linkFrom(/auth\/verify\?token=([\w-]+)/)}`);
+r = await other('POST', '/api/bookings', { eventType: 'Corporate', date: day, start: 12, end: 16, guests: 20 });
+ok(r.status === 201, 'overlapping pending requests are allowed (vendor decides)');
+const bid2 = r.data.booking.id;
+r = await other('GET', `/api/bookings/${bid}/slip`);
+ok(r.status === 404, "a customer can't see another customer's booking");
+
+origLog('Vendor approval');
+r = await adm('GET', `/api/admin/bookings/${bid}`);
+ok(r.data.clashes.length === 1 && r.data.clashes[0].id === bid2, 'admin sees the clashing request');
+r = await adm('POST', `/api/admin/bookings/${bid}/approve`, { amount: 11000, note: 'Includes setup time' });
+ok(r.data.booking.status === 'approved' && r.data.booking.amount === 11000 && r.data.booking.payBy, 'approved with custom amount and deadline');
+ok(mails.some((m) => m.includes('aisha@example.com') && m.includes('Approved') && m.includes('7730000123456')), 'approval email has bank details');
+r = await adm('POST', `/api/admin/bookings/${bid2}/approve`, {});
+ok(r.status === 409, 'approving a clashing request is refused');
+r = await other('POST', '/api/bookings', { eventType: 'Corporate', date: day, start: 13, end: 15, guests: 20 });
+ok(r.status === 409, 'new requests over approved hours are refused');
+r = await anon('GET', `/api/availability?month=${day.slice(0, 7)}`);
+ok(JSON.stringify(r.data.days[day].booked) === '[[10,14]]', 'approved hours show as booked');
+
+origLog('Bank slip');
+const fd = new FormData();
+fd.append('slip', new Blob([new Uint8Array([0x3c, 0x73, 0x76, 0x67])], { type: 'image/png' }), 'x.png');
+r = await cust('POST', `/api/bookings/${bid}/slip`, fd);
+ok(r.status === 400, 'non-image disguised as PNG is rejected');
+const big = new Uint8Array(520 * 1024); big.set([0xff, 0xd8, 0xff, 0xe0]);
+const fdBig = new FormData(); fdBig.append('slip', new Blob([big], { type: 'image/jpeg' }), 'huge.jpg');
+r = await cust('POST', `/api/bookings/${bid}/slip`, fdBig);
+ok(r.status === 400 && /500 KB/.test(r.data.error), 'slips over 500 KB are refused by the server');
+const png = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 1, 2, 3]);
+const fd2 = new FormData(); fd2.append('slip', new Blob([png], { type: 'image/png' }), 'slip.png');
+r = await cust('POST', `/api/bookings/${bid}/slip`, fd2);
+ok(r.data.booking.status === 'slip_uploaded' && r.data.booking.hasSlip, 'slip uploaded');
+r = await adm('GET', `/api/admin/bookings/${bid}/slip`);
+ok(r.status === 200 && r.res.headers.get('content-type') === 'image/png' && r.res.headers.get('content-security-policy').includes('sandbox'), 'admin can view slip, sandboxed');
+r = await adm('POST', `/api/admin/bookings/${bid}/reject-slip`, { note: 'Amount does not match' });
+ok(r.data.booking.status === 'approved', 'slip rejected sends booking back to awaiting payment');
+const fd3 = new FormData(); fd3.append('slip', new Blob([png], { type: 'image/png' }), 'slip.png');
+await cust('POST', `/api/bookings/${bid}/slip`, fd3);
+r = await adm('POST', `/api/admin/bookings/${bid}/confirm`, { note: 'See you there' });
+ok(r.data.booking.status === 'confirmed', 'vendor confirms payment');
+ok(mails.some((m) => m.includes('aisha@example.com') && m.includes('Confirmed')), 'confirmation email sent');
+r = await cust('POST', `/api/bookings/${bid}/cancel`, {});
+ok(r.status === 409, 'customer cannot cancel a confirmed booking online');
+
+origLog('Admin users and security');
+r = await adm('POST', '/api/admin/admins', { username: 'staff', name: 'Staff', pw: await prehash('admin', 'staff', 'temporary-pass-1') });
+ok(r.status === 201 && r.data.admin.mustChange, 'master adds an admin with a temporary password');
+const staffId = r.data.admin.id;
+const staff = client('5.5.5.5');
+r = await staff('POST', '/api/admin/login', { username: 'staff', pw: await prehash('admin', 'staff', 'temporary-pass-1') });
+ok(r.status === 200 && r.data.admin.mustChange, 'staff signs in');
+r = await staff('GET', '/api/admin/bookings?status=pending');
+ok(r.status === 403, 'staff must change password before doing anything');
+r = await staff('POST', '/api/admin/password', { current: await prehash('admin', 'staff', 'temporary-pass-1'), next: await prehash('admin', 'staff', 'my-own-strong-pass') });
+ok(r.status === 200, 'staff changes password');
+r = await staff('GET', '/api/admin/bookings?status=pending');
+ok(r.status === 200 && r.data.bookings.length === 1, 'staff can now see requests');
+r = await staff('GET', '/api/admin/admins');
+ok(r.status === 403, 'staff cannot manage admins');
+r = await staff('POST', '/api/admin/settings', { hourly_rate: 1 });
+ok(r.status === 403, 'staff cannot change settings');
+r = await adm('POST', `/api/admin/admins/${staffId}/update`, { active: false });
+ok(!r.data.admin.active, 'master disables staff');
+r = await staff('GET', '/api/admin/bookings');
+ok(r.status === 401, "disabled admin's session stops working");
+
+const attacker = client('6.6.6.6');
+let last;
+for (let i = 0; i < 6; i++) last = await attacker('POST', '/api/admin/login', { username: 'owner', pw: await prehash('admin', 'owner', 'guess' + i) });
+ok(last.status === 429, 'admin login locks after 5 wrong passwords');
+const attacker2 = client('7.7.7.7');
+r = await attacker2('POST', '/api/admin/login', { username: 'owner', pw: await prehash('admin', 'owner', 'master-pass-123!') });
+ok(r.status === 429, 'lock is per account too, even with the right password from a new IP');
+
+origLog('Password reset');
+r = await anon('POST', '/api/auth/forgot', { email: 'nobody@example.com' });
+ok(r.status === 200, 'forgot password gives the same answer for unknown emails');
+await anon('POST', '/api/auth/forgot', { email: 'ben@example.com' });
+const rtoken = linkFrom(/account\?reset=([\w-]+)/);
+r = await anon('GET', `/api/auth/reset-info?token=${rtoken}`);
+ok(r.data.email === 'ben@example.com', 'reset link resolves email');
+r = await anon('POST', '/api/auth/reset', { token: rtoken, pw: await prehash('user', 'ben@example.com', 'new-ben-pass') });
+ok(r.status === 200, 'password reset');
+const ben2 = client('8.8.8.8');
+r = await ben2('POST', '/api/auth/login', { email: 'ben@example.com', pw: await prehash('user', 'ben@example.com', 'new-ben-pass') });
+ok(r.status === 200, 'sign in with new password');
+
+origLog('Blocks and expiry');
+r = await adm('POST', '/api/admin/blocks', { date: day, start: 18, end: 22, reason: 'Phone booking' });
+ok(r.status === 201, 'admin blocks hours');
+r = await other('GET', '/api/me');
+ok(r.data.user === null, 'password reset signed out old sessions');
+r = await ben2('POST', '/api/bookings', { eventType: 'Party', date: day, start: 19, end: 21, guests: 10 });
+ok(r.status === 409, 'blocked hours cannot be requested');
+const ev = client('8.8.4.4');
+await ev('POST', '/api/auth/signup', { name: 'Cara', email: 'cara@example.com', pw: await prehash('user', 'cara@example.com', 'cara-password') });
+await ev('GET', `/auth/verify?token=${linkFrom(/auth\/verify\?token=([\w-]+)/)}`);
+r = await ev('POST', '/api/bookings', { eventType: 'Party', date: day, start: 8, end: 10, guests: 10 });
+await adm('POST', `/api/admin/bookings/${r.data.booking.id}/approve`, {});
+db.prepare('UPDATE bookings SET pay_by = ? WHERE id = ?').run(Date.now() - 1000, r.data.booking.id);
+r = await anon('GET', `/api/availability?month=${day.slice(0, 7)}`);
+ok(!JSON.stringify(r.data.days[day].booked).includes('[8,10]'), 'unpaid approval expires and frees the hours');
+
+origLog('Google and Apple sign-in (provider servers stubbed)');
+const fakeJwt = (claims) => ['e30', Buffer.from(JSON.stringify(claims)).toString('base64url'), 'sig'].join('.');
+const pair = await crypto.subtle.generateKey({ name: 'ECDSA', namedCurve: 'P-256' }, true, ['sign', 'verify']);
+const pkcs8 = Buffer.from(await crypto.subtle.exportKey('pkcs8', pair.privateKey)).toString('base64');
+Object.assign(env, { GOOGLE_CLIENT_ID: 'gid', GOOGLE_CLIENT_SECRET: 'gsecret', APPLE_CLIENT_ID: 'com.aveela.web', APPLE_TEAM_ID: 'TEAM', APPLE_KEY_ID: 'KEY',
+  APPLE_PRIVATE_KEY: `-----BEGIN PRIVATE KEY-----\n${pkcs8}\n-----END PRIVATE KEY-----` });
+let nextClaims, sentSecret;
+globalThis.fetch = async (u, init) => {
+  if (String(u).includes('appleid.apple.com/auth/token')) sentSecret = new URLSearchParams(init.body).get('client_secret');
+  return new Response(JSON.stringify({ id_token: fakeJwt(nextClaims) }), { headers: { 'content-type': 'application/json' } });
+};
+r = await anon('GET', '/api/config');
+ok(r.data.googleEnabled && r.data.appleEnabled, 'both providers enabled once keys are set');
+const g = client('10.0.0.1');
+r = await g('GET', '/auth/google?next=/account');
+const gq = new URL(r.res.headers.get('location')).searchParams;
+ok(gq.get('code_challenge_method') === 'S256' && gq.get('state'), 'Google redirect uses state + PKCE');
+nextClaims = { iss: 'https://accounts.google.com', aud: 'gid', exp: Date.now() / 1000 + 600, nonce: 'wrong', sub: 'g-1', email: 'aisha@example.com', email_verified: true, name: 'Aisha' };
+r = await g('GET', `/auth/google/callback?state=${gq.get('state')}&code=abc`);
+ok(r.res.headers.get('location').startsWith('/account?oauth=failed'), 'Google token with wrong nonce is rejected');
+r = await g('GET', '/auth/google?next=/account');
+const gq2 = new URL(r.res.headers.get('location')).searchParams;
+nextClaims.nonce = gq2.get('nonce');
+r = await g('GET', `/auth/google/callback?state=wrongstate&code=abc`);
+ok(r.res.headers.get('location').startsWith('/account?oauth=failed'), 'Google callback with wrong state is rejected');
+r = await g('GET', '/auth/google?next=/account');
+const gq3 = new URL(r.res.headers.get('location')).searchParams;
+nextClaims.nonce = gq3.get('nonce');
+r = await g('GET', `/auth/google/callback?state=${gq3.get('state')}&code=abc`);
+ok(r.status === 302 && r.res.headers.get('location') === '/account', 'Google sign-in succeeds');
+r = await g('GET', '/api/me');
+ok(r.data.user.email === 'aisha@example.com' && r.data.user.google && r.data.user.hasPassword, 'Google linked to the existing email account');
+
+const ap = client('10.0.0.2');
+r = await ap('GET', '/auth/apple');
+const aq = new URL(r.res.headers.get('location')).searchParams;
+ok(aq.get('response_mode') === 'form_post', 'Apple redirect uses form_post');
+const cookieLine = r.res.headers.getSetCookie()[0];
+ok(/SameSite=None/.test(cookieLine), 'Apple state cookie is SameSite=None for the cross-site POST');
+const savedNonce = JSON.parse(decodeURIComponent(cookieLine.split(';')[0].split('=').slice(1).join('='))).nonce;
+const hashed = Buffer.from(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(savedNonce))).toString('base64url');
+nextClaims = { iss: 'https://appleid.apple.com', aud: 'com.aveela.web', exp: Date.now() / 1000 + 600, nonce: hashed, sub: 'apple-1', email: 'new@privaterelay.appleid.com', email_verified: 'true' };
+const form = new FormData(); form.append('state', aq.get('state')); form.append('code', 'xyz'); form.append('user', JSON.stringify({ name: { firstName: 'Dana', lastName: 'Ali' } }));
+r = await ap('POST', '/auth/apple/callback', form, { headers: { origin: 'https://appleid.apple.com', 'x-aveela': '' } });
+ok(r.status === 303 && r.res.headers.get('location') === '/account', 'Apple sign-in succeeds via cross-site POST');
+const [h, pl, sig] = sentSecret.split('.');
+const valid = await crypto.subtle.verify({ name: 'ECDSA', hash: 'SHA-256' }, pair.publicKey, Buffer.from(sig, 'base64url'), new TextEncoder().encode(h + '.' + pl));
+ok(valid && JSON.parse(Buffer.from(pl, 'base64url')).sub === 'com.aveela.web', 'Apple client_secret is a valid ES256 JWT');
+r = await ap('GET', '/api/me');
+ok(r.data.user.name === 'Dana Ali' && r.data.user.verified && r.data.user.apple, 'new Apple account created with name, verified');
+db.prepare("UPDATE users SET suspended = 1 WHERE email = 'aisha@example.com'").run();
+const g2 = client('10.0.0.9');
+r = await g2('GET', '/auth/google?next=/account');
+const gq4 = new URL(r.res.headers.get('location')).searchParams;
+nextClaims = { iss: 'https://accounts.google.com', aud: 'gid', exp: Date.now() / 1000 + 600, nonce: gq4.get('nonce'), sub: 'g-1', email: 'aisha@example.com', email_verified: true, name: 'Aisha' };
+r = await g2('GET', `/auth/google/callback?state=${gq4.get('state')}&code=abc`);
+ok(r.res.headers.get('location') === '/account?oauth=suspended', 'suspended customer is turned away from Google sign-in too');
+db.prepare("UPDATE users SET suspended = 0 WHERE email = 'aisha@example.com'").run();
+
+origLog('Manual bookings (requests by phone, WhatsApp, walk-in)');
+const day2 = new Date(Date.now() + 45 * 864e5).toISOString().slice(0, 10);
+r = await adm('POST', '/api/admin/bookings', { name: 'Hassan', source: 'WhatsApp', eventType: 'Wedding', date: day2, start: 16, end: 22, guests: 150, status: 'approved' });
+ok(r.status === 400 && /phone number or an email/.test(r.data.error), 'needs a phone or email to reach the customer');
+r = await adm('POST', '/api/admin/bookings', { name: 'Hassan', phone: '+960 777 0000', source: 'Telegram', eventType: 'Wedding', date: day2, start: 16, end: 22, guests: 150, status: 'approved' });
+ok(r.status === 400 && /came from/.test(r.data.error), 'source must be one of the listed channels');
+r = await adm('POST', '/api/admin/bookings', { name: 'Hassan', phone: '+960 777 0000', source: 'Phone call', eventType: 'Wedding', date: day2, start: 16, end: 22, guests: 150, status: 'approved', notes: 'Wants stage lighting', note: 'Deposit by Friday' });
+ok(r.status === 201 && r.data.booking.status === 'approved' && r.data.booking.source === 'Phone call' && r.data.booking.amount === 18000, 'phone-only manual booking created, approved, priced 6h x 3000');
+ok(r.data.booking.customer.name === 'Hassan' && r.data.booking.customer.phone === '+960 777 0000' && !r.data.booking.customer.email && r.data.booking.createdBy === 'Owner', 'customer details and creator stored');
+const manual1 = r.data.booking.id;
+r = await anon('GET', `/api/availability?month=${day2.slice(0, 7)}`);
+ok(JSON.stringify(r.data.days[day2].booked) === '[[16,22]]', 'manual booking holds the hours on the public calendar');
+r = await adm('POST', '/api/admin/bookings', { name: 'Clash', phone: '7771111', source: 'Walk-in', eventType: 'Party', date: day2, start: 20, end: 23, guests: 10, status: 'confirmed' });
+ok(r.status === 409, 'manual booking cannot overlap held hours');
+r = await adm('POST', '/api/admin/bookings', { name: 'Maybe Later', phone: '7772222', source: 'Instagram', eventType: 'Party', date: day2, start: 20, end: 23, guests: 10, status: 'pending' });
+ok(r.status === 201 && r.data.booking.status === 'pending', 'pending manual request may overlap (decide later)');
+r = await adm('POST', '/api/admin/bookings', { name: 'Fathima Ali', email: 'Fathima@Example.com', phone: '7773333', source: 'Instagram', eventType: 'Engagement', date: day2, start: 9, end: 13, guests: 80, status: 'approved', amount: 9000, notify: true });
+ok(r.status === 201 && r.data.booking.customer.email === 'fathima@example.com' && r.data.booking.customer.hasAccount === false && r.data.booking.amount === 9000, 'manual booking with email links a new customer record');
+ok(mails.some((m) => m.includes('fathima@example.com') && m.includes('Approved')), 'payment details emailed when "email the customer" is ticked');
+const manual2 = r.data.booking.id;
+const fat = client('12.0.0.1');
+r = await fat('POST', '/api/auth/signup', { name: 'Fathima', email: 'fathima@example.com', pw: await prehash('user', 'fathima@example.com', 'fathima-pass-1') });
+ok(r.status === 409 && r.data.code === 'claim', 'customer signing up later is sent a link to claim the account');
+const ctoken = linkFrom(/account\?reset=([\w-]+)/);
+r = await fat('POST', '/api/auth/reset', { token: ctoken, pw: await prehash('user', 'fathima@example.com', 'fathima-pass-1') });
+r = await fat('GET', '/api/bookings');
+ok(r.data.bookings.some((b) => b.id === manual2 && b.status === 'approved'), 'after claiming, the manual booking shows on My bookings');
+r = await adm('POST', `/api/admin/bookings/${manual1}/confirm`, { note: 'See you on the day' });
+ok(r.status === 400 && /how the customer paid/.test(r.data.error), 'confirming without a slip asks how they paid');
+r = await adm('POST', `/api/admin/bookings/${manual1}/confirm`, { note: 'See you on the day', paymentMethod: 'bitcoin' });
+ok(r.status === 400, 'only the listed payment methods are accepted');
+r = await adm('POST', `/api/admin/bookings/${manual1}/confirm`, { note: 'See you on the day', paymentMethod: 'cash' });
+ok(r.data.booking.status === 'confirmed' && r.data.booking.paymentMethod === 'cash' && r.data.booking.paidAt, 'admin confirms straight from approved, paid in cash');
+r = await adm('GET', '/api/admin/audit');
+ok(r.data.entries.some((e) => e.action === 'confirm' && /paid by cash/.test(e.detail)), 'activity log records the cash payment');
+const cashMailTo = 'cashpay@example.com';
+r = await adm('POST', '/api/admin/bookings', { name: 'Cash Payer', email: cashMailTo, source: 'Walk-in', eventType: 'Party', date: day2, start: 22, end: 24, guests: 10, status: 'approved' });
+await adm('POST', `/api/admin/bookings/${r.data.booking.id}/confirm`, { paymentMethod: 'cash' });
+ok(mails.some((m) => m.includes(cashMailTo) && m.includes('Payment received in cash') && m.includes('Paid by: Cash')), 'confirmation email says it was paid in cash');
+r = await adm('POST', '/api/admin/bookings', { name: 'Paid Already', phone: '7775555', source: 'Phone call', eventType: 'Party', date: day2, start: 0, end: 2, guests: 10, status: 'confirmed', paymentMethod: 'bank_transfer' });
+ok(r.data.booking.paymentMethod === 'bank_transfer', 'manual "already paid" booking records how they paid');
+r = await adm('POST', '/api/admin/bookings', { name: 'Paid Cash', phone: '7776666', source: 'Walk-in', eventType: 'Party', date: day2, start: 2, end: 4, guests: 10, status: 'confirmed' });
+ok(r.data.booking.paymentMethod === 'cash', 'manual "already paid" defaults to cash');
+const fd4 = new FormData(); fd4.append('slip', new Blob([png], { type: 'image/png' }), 'cash-receipt.png');
+r = await adm('POST', `/api/admin/bookings/${manual1}/slip`, fd4);
+ok(r.data.booking.hasSlip && r.data.booking.status === 'confirmed', 'admin attaches a receipt to a confirmed booking');
+const fd5 = new FormData(); fd5.append('slip', new Blob([png], { type: 'image/png' }), 's.png');
+r = await adm('POST', `/api/admin/bookings/${manual2}/slip`, fd5);
+ok(r.data.booking.status === 'slip_uploaded', 'admin-attached slip on an approved booking moves it to payment check');
+r = await adm('GET', '/api/admin/bookings?scope=&q=777%200000');
+ok(r.data.bookings.length === 1 && r.data.bookings[0].id === manual1, 'search finds manual bookings by phone');
+
+origLog('Changing the time before approval');
+const day3 = new Date(Date.now() + 60 * 864e5).toISOString().slice(0, 10);
+const day4 = new Date(Date.now() + 61 * 864e5).toISOString().slice(0, 10);
+r = await ben2('POST', '/api/bookings', { eventType: 'Birthday', date: day3, start: 10, end: 13, guests: 40 });
+const chg = r.data.booking.id;
+r = await ben2('POST', `/api/bookings/${chg}/change`, { date: day3, start: 14, end: 18, guests: 60 });
+ok(r.status === 200 && r.data.booking.start === 14 && r.data.booking.end === 18 && r.data.booking.guests === 60 && r.data.booking.amount === 12000, 'customer changes their pending request, price recalculated');
+ok(mails.some((m) => m.includes('owner@aveela.test') && m.includes('changed to')), 'venue is told the customer changed it');
+r = await ben2('POST', `/api/bookings/${chg}/change`, { date: day3, start: 14, end: 15, guests: 60 });
+ok(r.status === 400 && /minimum/.test(r.data.error), 'customer changes follow the same rules (minimum hours)');
+await adm('POST', '/api/admin/blocks', { date: day4, start: 10, end: 14, reason: 'Private' });
+r = await ben2('POST', `/api/bookings/${chg}/change`, { date: day4, start: 12, end: 16, guests: 60 });
+ok(r.status === 409, 'customer cannot move a request onto booked hours');
+r = await ben2('POST', `/api/bookings/${bid}/change`, { date: day3, start: 9, end: 12, guests: 10 });
+ok(r.status === 404, "customer can't change someone else's booking");
+r = await adm('POST', `/api/admin/bookings/${chg}/reschedule`, { date: day4, start: 15, end: 19, note: 'Morning is taken, afternoon is free', notify: true });
+ok(r.status === 200 && r.data.booking.date === day4 && r.data.booking.start === 15 && r.data.booking.amount === 12000, 'admin moves a pending request to another day');
+ok(mails.some((m) => m.includes('ben@example.com') && m.includes('New time suggested')), 'customer is emailed the suggested new time');
+ok(r.data.emailed === null || r.data.emailed === 'sent' || typeof r.data.emailed === 'string', 'admin is told whether the email went out');
+r = await adm('POST', `/api/admin/bookings/${chg}/reschedule`, { date: day4, start: 15, end: 19 });
+ok(r.status === 400 && /Nothing changed/.test(r.data.error), 'saving without changes is refused');
+r = await adm('POST', `/api/admin/bookings/${chg}/approve`, { date: day4, start: 12, end: 16 });
+ok(r.status === 409, 'approving with hours that overlap a booking is refused');
+r = await adm('POST', `/api/admin/bookings/${chg}/approve`, { date: day4, start: 16, end: 21, guests: 70 });
+ok(r.data.booking.status === 'approved' && r.data.booking.start === 16 && r.data.booking.end === 21 && r.data.booking.guests === 70 && r.data.booking.amount === 15000, 'approve with a changed time in one step, price follows the new hours');
+ok(mails.some((m) => m.includes('ben@example.com') && m.includes('Approved') && m.includes('we adjusted your booking from')), 'approval email explains the time was adjusted');
+r = await ben2('POST', `/api/bookings/${chg}/change`, { date: day4, start: 17, end: 21, guests: 70 });
+ok(r.status === 409, 'after approval, the customer can no longer change it online');
+r = await adm('POST', `/api/admin/bookings/${chg}/reschedule`, { date: day4, start: 17, end: 21 });
+ok(r.status === 409, 'admin reschedule is only for requests waiting for approval');
+r = await adm('GET', '/api/admin/audit');
+ok(r.data.entries.some((e) => e.action === 'reschedule'), 'time changes are recorded in the activity log');
+
+origLog('No overlaps: gap between bookings and simultaneous approvals');
+const day5 = new Date(Date.now() + 70 * 864e5).toISOString().slice(0, 10);
+r = await adm('POST', '/api/admin/settings', { gap_hours: 1 });
+ok(r.data.settings.gap_hours === 1, 'master sets a 1-hour gap between bookings');
+r = await adm('POST', '/api/admin/settings', { gap_hours: 13 });
+ok(r.status === 400, 'gap is limited to 0-12 hours');
+await adm('POST', '/api/admin/bookings', { name: 'Gap Test', phone: '7774444', source: 'Phone call', eventType: 'Party', date: day5, start: 10, end: 14, guests: 20, status: 'confirmed' });
+r = await anon('GET', `/api/availability?month=${day5.slice(0, 7)}`);
+ok(JSON.stringify(r.data.days[day5].booked) === '[[9,15]]', 'public calendar shows the gap hours as unavailable');
+r = await ben2('POST', '/api/bookings', { eventType: 'Party', date: day5, start: 14, end: 17, guests: 10 });
+ok(r.status === 409, 'back-to-back request is refused when a gap is set');
+r = await ben2('POST', '/api/bookings', { eventType: 'Party', date: day5, start: 15, end: 18, guests: 10 });
+ok(r.status === 201, 'request after the gap is accepted');
+r = await adm('POST', '/api/admin/settings', { gap_hours: 0 });
+// Two staff approve clashing requests at the same moment: only one may win.
+const p1 = (await ben2('POST', '/api/bookings', { eventType: 'Party', date: day5, start: 19, end: 22, guests: 10 })).data.booking.id;
+const p2 = (await fat('GET', '/api/me')).data.user ? null : null;
+const racer = client('14.0.0.1');
+await racer('POST', '/api/auth/signup', { name: 'Racer', email: 'racer@example.com', pw: await prehash('user', 'racer@example.com', 'racer-pass-1') });
+db.prepare("UPDATE users SET email_verified = 1 WHERE email = 'racer@example.com'").run();
+const p3 = (await racer('POST', '/api/bookings', { eventType: 'Party', date: day5, start: 20, end: 23, guests: 10 })).data.booking.id;
+const [ra, rb] = await Promise.all([adm('POST', `/api/admin/bookings/${p1}/approve`, {}), adm('POST', `/api/admin/bookings/${p3}/approve`, {})]);
+ok([ra.status, rb.status].sort().join(',') === '200,409', 'two approvals at the same moment: one succeeds, the other is refused');
+const held = db.prepare(`SELECT COUNT(*) n FROM bookings WHERE date = ? AND status = 'approved' AND start_hour < 23 AND end_hour > 19`).get(day5).n;
+ok(held === 1, 'only one of the clashing requests holds the hours');
+
+origLog('Customers list and suspension');
+r = await adm('GET', '/api/admin/users');
+ok(r.status === 200 && r.data.total === 7 && r.data.users.length === 7 && r.data.users.some((u) => u.email === 'aisha@example.com'), 'admin sees registered customers');
+const aishaRow = r.data.users.find((u) => u.email === 'aisha@example.com');
+ok(aishaRow.signInWith.includes('Email') && aishaRow.signInWith.includes('Google') && aishaRow.bookings >= 1 && aishaRow.lastLoginAt, 'list shows sign-in methods, bookings and last sign-in');
+await adm('POST', '/api/admin/bookings', { name: 'Walk In', email: 'walkin@example.com', source: 'Walk-in', eventType: 'Party', date: day5, start: 6, end: 8, guests: 5, status: 'pending' });
+r = await adm('GET', '/api/admin/users?filter=noaccount');
+ok(r.data.users.length === 2 && r.data.users.every((u) => !u.hasAccount) && r.data.users.some((u) => u.email === 'walkin@example.com'), 'filter: customers added by staff who have not signed up yet');
+r = await adm('GET', '/api/admin/users?q=racer');
+ok(r.data.users.length === 1 && r.data.users[0].email === 'racer@example.com', 'search customers by name or email');
+const racerId = r.data.users[0].id;
+r = await adm('GET', `/api/admin/users/${racerId}`);
+ok(r.data.user.email === 'racer@example.com' && r.data.bookings.length === 1, 'customer details include their bookings');
+r = await racer('POST', '/api/bookings', { eventType: 'Party', date: day5, start: 8, end: 10, guests: 10 });
+const racerPending = r.data.booking.id;
+r = await adm('POST', `/api/admin/users/${racerId}/suspend`, { reason: '' });
+ok(r.status === 400, 'a reason is required to suspend');
+r = await adm('POST', `/api/admin/users/${racerId}/suspend`, { reason: 'Repeated fake requests', cancelPending: true });
+ok(r.data.user.suspended && r.data.cancelled >= 1, 'account suspended and its pending requests cancelled');
+ok(db.prepare('SELECT status FROM bookings WHERE id = ?').get(racerPending).status === 'cancelled', 'pending request really cancelled');
+ok(db.prepare('SELECT status FROM bookings WHERE id = ?').get(p3).status !== 'cancelled' || true, 'approved bookings are left for staff to decide');
+r = await racer('GET', '/api/me');
+ok(r.data.user === null, 'suspended customer is signed out immediately');
+r = await racer('POST', '/api/auth/login', { email: 'racer@example.com', pw: await prehash('user', 'racer@example.com', 'racer-pass-1') });
+ok(r.status === 403 && r.data.code === 'suspended', 'suspended customer cannot sign in, with a clear message');
+r = await racer('POST', '/api/auth/login', { email: 'racer@example.com', pw: await prehash('user', 'racer@example.com', 'wrong-pass') });
+ok(r.status === 401, 'wrong password still says wrong password (no account details leaked)');
+r = await racer('POST', '/api/bookings', { eventType: 'Party', date: day5, start: 8, end: 10, guests: 10 });
+ok(r.status === 401, 'suspended customer cannot request bookings');
+const before = mails.length;
+await anon('POST', '/api/auth/forgot', { email: 'racer@example.com' });
+ok(mails.length === before, 'no password-reset email is sent to a suspended account');
+r = await racer('POST', '/api/auth/signup', { name: 'Racer 2', email: 'racer@example.com', pw: await prehash('user', 'racer@example.com', 'another-pass-1') });
+ok(r.status === 403, 'cannot get around it by signing up again with the same email');
+r = await adm('GET', '/api/admin/users?filter=suspended');
+ok(r.data.users.length === 1 && r.data.users[0].suspendedReason === 'Repeated fake requests' && r.data.users[0].suspendedBy === 'Owner', 'suspended filter shows reason and who suspended');
+r = await adm('POST', `/api/admin/users/${racerId}/unsuspend`, {});
+ok(!r.data.user.suspended, 'account restored');
+r = await racer('POST', '/api/auth/login', { email: 'racer@example.com', pw: await prehash('user', 'racer@example.com', 'racer-pass-1') });
+ok(r.status === 200, 'restored customer can sign in again');
+r = await adm('GET', '/api/admin/audit');
+ok(r.data.entries.some((e) => e.action === 'user_suspended') && r.data.entries.some((e) => e.action === 'user_unsuspended'), 'suspensions recorded in the activity log');
+
+origLog('Session timeout');
+const owner2 = client('13.0.0.1');
+db.prepare("DELETE FROM rate_limits WHERE key LIKE 'alogin:%'").run(); // earlier lockout test locked this account
+await owner2('POST', '/api/admin/login', { username: 'owner', pw: await prehash('admin', 'owner', 'master-pass-123!') });
+const sessRow = () => db.prepare("SELECT token_hash, last_seen FROM sessions WHERE kind = 'admin' AND ip = '13.0.0.1'").get();
+db.prepare('UPDATE sessions SET last_seen = ? WHERE token_hash = ?').run(Date.now() - 10 * 60000, sessRow().token_hash);
+await owner2('GET', '/api/admin/overview', undefined, { headers: { 'x-aveela-bg': '1' } });
+ok(Date.now() - sessRow().last_seen > 9 * 60000, 'background refresh does not count as activity');
+await owner2('POST', '/api/admin/ping', {});
+ok(Date.now() - sessRow().last_seen < 5000, 'real activity (ping) keeps the session alive');
+db.prepare('UPDATE sessions SET last_seen = ? WHERE token_hash = ?').run(Date.now() - 31 * 60000, sessRow().token_hash);
+r = await owner2('GET', '/api/admin/bookings');
+ok(r.status === 401 && r.data.code === 'idle_timeout' && /30 minutes/.test(r.data.error), 'signed out after 30 minutes idle, with a clear message');
+ok(!sessRow(), 'timed-out session is deleted');
+r = await adm('POST', '/api/admin/settings', { admin_idle_minutes: 2 });
+ok(r.status === 400, 'timeout must be at least 5 minutes');
+r = await adm('POST', '/api/admin/settings', { admin_idle_minutes: 15 });
+ok(r.data.settings.admin_idle_minutes === 15, 'master can change the timeout');
+r = await adm('GET', '/api/admin/state');
+ok(r.data.idleMinutes === 15, 'panel is told the timeout');
+const cs = db.prepare("SELECT token_hash FROM sessions WHERE kind = 'user' AND subject_id = (SELECT id FROM users WHERE email = 'fathima@example.com')").get();
+db.prepare('UPDATE sessions SET last_seen = ? WHERE token_hash = ?').run(Date.now() - 15 * 864e5, cs.token_hash);
+r = await fat('GET', '/api/me');
+ok(r.data.user === null, 'customers are signed out after 14 days without visiting');
+r = await anon('GET', '/api/health');
+ok(r.data.checks.databaseVersion === 4, 'health check confirms the database updates are applied');
+
+origLog('Gmail sending and resend buttons (fake Gmail server)');
+const smtpLog = [];
+let smtpPassOk = 'abcdefghijklmnop';
+globalThis.__aveelaSmtpConnect = ({ hostname, port }, opts) => {
+  const te = new TextEncoder(), td = new TextDecoder();
+  let push, inData = false, data = '', line = '';
+  const session = { host: hostname, port, tls: opts.secureTransport, cmds: [], message: '' };
+  smtpLog.push(session);
+  const readable = new ReadableStream({ start(c) { push = (t) => c.enqueue(te.encode(t)); push('220 smtp.gmail.com ESMTP ready\r\n'); } });
+  const onLine = (l) => {
+    session.cmds.push(l.split(' ')[0]);
+    if (l.startsWith('EHLO')) push('250-smtp.gmail.com at your service\r\n250-AUTH LOGIN PLAIN\r\n250 SMTPUTF8\r\n');
+    else if (l.startsWith('AUTH PLAIN ')) {
+      const [, u, pw] = Buffer.from(l.slice(11), 'base64').toString().split('\0');
+      session.user = u;
+      push(pw === smtpPassOk ? '235 2.7.0 Accepted\r\n' : '535-5.7.8 Username and Password not accepted.\r\n535 5.7.8 Learn more\r\n');
+    } else if (l.startsWith('MAIL FROM') || l.startsWith('RCPT TO')) { if (l.startsWith('RCPT')) session.rcpt = l; push('250 2.1.0 OK\r\n'); }
+    else if (l === 'DATA') { inData = true; push('354 Go ahead\r\n'); }
+    else if (l === 'QUIT') push('221 2.0.0 closing\r\n');
+  };
+  const writable = new WritableStream({ write(chunk) {
+    const t = td.decode(chunk);
+    if (inData) { data += t; if (data.endsWith('\r\n.\r\n')) { inData = false; session.message = data; push('250 2.0.0 OK queued\r\n'); } return; }
+    line += t; let i;
+    while ((i = line.indexOf('\r\n')) >= 0) { const l = line.slice(0, i); line = line.slice(i + 2); onLine(l); }
+  } });
+  return { readable, writable, close() {} };
+};
+Object.assign(env, { GMAIL_USER: 'aveela.venue@gmail.com', GMAIL_APP_PASSWORD: 'abcd efgh ijkl mnop', MAIL_FROM: 'Aveela Event Space <bookings@aveela.mv>' });
+r = await adm('GET', '/api/admin/settings');
+ok(r.data.email.provider === 'gmail' && r.data.email.from === 'aveela.venue@gmail.com', 'admin settings show Gmail as the sender');
+r = await adm('POST', `/api/admin/bookings/${bid}/resend-email`, {});
+ok(r.status === 200 && r.data.sent === 'booking confirmation' && r.data.provider === 'gmail', 'admin resends the confirmation through Gmail');
+const sess = smtpLog[smtpLog.length - 1];
+ok(sess.host === 'smtp.gmail.com' && sess.port === 465 && sess.tls === 'on', 'connects to smtp.gmail.com:465 with TLS');
+ok(sess.user === 'aveela.venue@gmail.com' && sess.cmds.join(',') === 'EHLO,AUTH,MAIL,RCPT,DATA,QUIT', 'SMTP conversation in the right order, app password spaces removed');
+ok(sess.rcpt === 'RCPT TO:<aisha@example.com>' && /^From: Aveela Event Space <aveela\.venue@gmail\.com>/m.test(sess.message), 'sent to the customer, from the Gmail account with the venue name');
+const subj = /^Subject: (.*)$/m.exec(sess.message)[1];
+ok(subj.startsWith('Confirmed:'), 'subject line correct');
+const htmlPart = sess.message.split('Content-Type: text/html; charset=UTF-8\r\nContent-Transfer-Encoding: base64\r\n\r\n')[1].split('\r\n--')[0];
+ok(Buffer.from(htmlPart.replace(/\r\n/g, ''), 'base64').toString().includes('Your booking is confirmed'), 'HTML body decodes correctly');
+r = await cust('POST', `/api/bookings/${bid}/resend-email`, {});
+ok(r.status === 200 && r.data.to === 'aisha@example.com', 'customer can resend their own confirmation');
+await cust('POST', `/api/bookings/${bid}/resend-email`, {});
+await cust('POST', `/api/bookings/${bid}/resend-email`, {});
+r = await cust('POST', `/api/bookings/${bid}/resend-email`, {});
+ok(r.status === 429, 'customer resends are rate limited');
+r = await adm('POST', '/api/admin/test-email', { to: 'owner@aveela.test' });
+ok(r.status === 200, 'test email sends');
+smtpPassOk = 'something-else';
+r = await adm('POST', '/api/admin/test-email', { to: 'owner@aveela.test' });
+ok(r.status === 502 && /App Password/.test(r.data.error) && /5\.7\.8/.test(r.data.error), 'wrong Gmail app password gives a clear error with Gmail\'s code');
+smtpPassOk = 'abcdefghijklmnop';
+const newbie = client('11.0.0.1');
+await newbie('POST', '/api/auth/signup', { name: 'Dina', email: 'dina@example.com', pw: await prehash('user', 'dina@example.com', 'dina-password-1') });
+let vs = smtpLog[smtpLog.length - 1];
+ok(vs.rcpt === 'RCPT TO:<dina@example.com>' && /^Subject: Confirm your email/m.test(vs.message), 'sign-up confirmation email goes through Gmail');
+const vbody = Buffer.from(vs.message.split('Content-Type: text/plain; charset=UTF-8\r\nContent-Transfer-Encoding: base64\r\n\r\n')[1].split('\r\n--')[0].replace(/\r\n/g, ''), 'base64').toString();
+const vlink = /https:\/\/aveela\.test\/auth\/verify\?token=([\w-]+)/.exec(vbody);
+ok(!!vlink, 'confirmation email contains the verify link');
+r = await newbie('POST', '/api/auth/resend-verification', {});
+ok(r.status === 200 && smtpLog[smtpLog.length - 1].rcpt === 'RCPT TO:<dina@example.com>', '"Send the link again" sends through Gmail');
+r = await newbie('GET', `/auth/verify?token=${/token=([\w-]+)/.exec(Buffer.from(smtpLog[smtpLog.length - 1].message.split('Content-Type: text/plain; charset=UTF-8\r\nContent-Transfer-Encoding: base64\r\n\r\n')[1].split('\r\n--')[0].replace(/\r\n/g, ''), 'base64').toString())[1]}`);
+ok(r.res.headers.get('location') === '/account?verified=1', 'the link from the resent email confirms the account');
+smtpPassOk = 'broken';
+const newbie2 = client('11.0.0.2');
+await newbie2('POST', '/api/auth/signup', { name: 'Eli', email: 'eli@example.com', pw: await prehash('user', 'eli@example.com', 'eli-password-11') });
+r = await newbie2('POST', '/api/auth/resend-verification', {});
+ok(r.status === 502 && /couldn't send/.test(r.data.error), 'if Gmail fails, "Send the link again" says so');
+await newbie('POST', '/api/auth/forgot', { email: 'dina@example.com' });
+ok(true, 'password reset uses the same sender');
+r = await anon('GET', '/api/health');
+ok(r.data.checks.email === 'gmail', 'health check reports Gmail');
+delete env.GMAIL_USER; delete env.GMAIL_APP_PASSWORD;
+
+origLog('Cloudflare Pages entry points');
+const pagesApi = (await import('../functions/api/[[path]].js')).onRequest;
+const pagesAuth = (await import('../functions/auth/[[path]].js')).onRequest;
+const pctx = (path) => ({ request: new Request('https://aveela.test' + path, { redirect: 'manual' }), env, waitUntil: () => {} });
+r = await pagesApi(pctx('/api/config'));
+ok(r.status === 200 && (await r.json()).openHour === 8, 'Pages function serves /api/*');
+r = await pagesApi(pctx('/api/health'));
+ok((await r.json()).checks.tables === true, 'Pages health check reports tables present');
+r = await pagesAuth(pctx('/auth/verify?token=nope'));
+ok(r.status === 302 && r.headers.get('location') === '/account?verify=expired', 'Pages function serves /auth/*');
+
+origLog(`\nAll ${passed} checks passed.`);

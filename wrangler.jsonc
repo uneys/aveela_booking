@@ -1,0 +1,30 @@
+{
+  // Aveela Event Space on Cloudflare Workers (free plan).
+  // Before the first deploy: replace both REPLACE_ME ids (from the Cloudflare dashboard) and set APP_URL.
+  // These ids are not secret, so it is safe to commit them to GitHub.
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "aveela",
+  "main": "src/index.js",
+  "compatibility_date": "2025-06-01",
+  "assets": {
+    "directory": "./public",
+    "binding": "ASSETS",
+    "run_worker_first": true,
+    "html_handling": "auto-trailing-slash",
+    "not_found_handling": "404-page"
+  },
+  "d1_databases": [
+    { "binding": "DB", "database_name": "aveela", "database_id": "REPLACE_ME", "migrations_dir": "migrations" }
+  ],
+  "kv_namespaces": [
+    { "binding": "SLIPS", "id": "REPLACE_ME" }
+  ],
+  "triggers": { "crons": ["17 * * * *"] },
+  "vars": {
+    "APP_URL": "https://aveela.YOUR-SUBDOMAIN.workers.dev",
+    "MAIL_FROM": "Aveela Event Space <bookings@your-domain.com>",
+    "VENUE_TZ": "Indian/Maldives",
+    "SERVER_HASH_ITERATIONS": "20000"
+  },
+  "observability": { "enabled": true }
+}
